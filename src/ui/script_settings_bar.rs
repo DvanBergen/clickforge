@@ -1,11 +1,13 @@
+mod status_strips;
+
 use egui::{
     Align, Button, Checkbox, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin, Popup,
     PopupCloseBehavior, RichText, Sense, Stroke, TextEdit, Ui, vec2,
 };
 
 use crate::models::{
-    CoordinatorSnapshot, ScriptDocument, ScriptMode, TargetScope, ValidationIssueCode,
-    ValidationReport, inspect_script_validation,
+    CoordinatorSnapshot, ScriptDocument, ScriptMode, TargetScope, ValidationReport,
+    inspect_script_validation,
 };
 use crate::ui::theme::{
     ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE,
@@ -13,18 +15,29 @@ use crate::ui::theme::{
     FONT_SIZE_SMALL_PX, INK_ON_ACCENT, STATUS_DANGER, STATUS_DANGER_INK, STATUS_DANGER_SOLID,
     STATUS_DANGER_TINT, STATUS_RUNNING, STATUS_RUNNING_INK, STATUS_RUNNING_TINT, SURFACE_CODE,
     SURFACE_ELEVATED, SURFACE_HOVER, SURFACE_PANEL, TEXT_MUTED, TEXT_PRIMARY, build_styled_button,
-    font_family_semibold, render_badge_pill, rich_bold, rich_mono, rich_mono_bold, rich_semibold,
+    font_family_semibold, rich_bold, rich_mono, rich_mono_bold, rich_semibold,
     truncate_display_text,
 };
 
+use status_strips::{
+    has_kill_switch_collision, render_editor_live_status_pill, render_emergency_stop_banner,
+    render_inline_setup_strip,
+};
+
 const SCRIPT_NAME_INPUT_WIDTH_PX: f32 = 196.0;
+const SCRIPT_NAME_MIN_WIDTH_PX: f32 = 96.0;
+const COMPACT_ROW_WIDTH_THRESHOLD_PX: f32 = 760.0;
+const COMPACT_STOPPED_ROW_WIDTH_THRESHOLD_PX: f32 = 850.0;
+const ROW_ONE_RESERVED_WIDE_PX: f32 = 576.0;
+const ROW_ONE_RESERVED_WIDE_STOPPED_PX: f32 = 650.0;
+const ROW_ONE_RESERVED_COMPACT_PX: f32 = 486.0;
+const ROW_ONE_RESERVED_COMPACT_STOPPED_PX: f32 = 560.0;
 const SCRIPT_NAME_FONT_SIZE_PX: f32 = 15.5;
-const HEADER_CONTROL_HEIGHT_PX: f32 = 28.0;
+pub(crate) const HEADER_CONTROL_HEIGHT_PX: f32 = 28.0;
 const CONTEXT_CHIP_HEIGHT_PX: f32 = 25.0;
-const INLINE_STRIP_BUTTON_HEIGHT_PX: f32 = 22.0;
+pub(crate) const INLINE_STRIP_BUTTON_HEIGHT_PX: f32 = 22.0;
 const SEGMENT_INNER_RADIUS_PX: u8 = CORNER_RADIUS_PILL_PX.saturating_sub(3);
 const MAX_TARGET_LABEL_CHARS: usize = 22;
-const MAX_INLINE_VALIDATION_ISSUES: usize = 2;
 const OPTIONS_POPOVER_WIDTH_PX: f32 = 284.0;
 
 /// Identifies which hotkey binding control is actively awaiting a keyboard press.
@@ -44,6 +57,7 @@ pub enum SettingsBarAction {
     ClearArmToggleKey,
     SaveActiveScript,
     ToggleActiveScriptEnabled(bool),
+    OpenActiveDashboard,
     EmergencyStopAll,
     ClearEmergencyStop,
     MarkActiveScriptDirty,
@@ -67,10 +81,22 @@ pub fn render_script_settings_bar(
     let validation_report = inspect_script_validation(script);
     let is_valid = validation_report.is_valid();
 
+    let row_width_px = ui.available_width();
+    let is_compact_row = row_width_px < COMPACT_ROW_WIDTH_THRESHOLD_PX
+        || (snapshot.is_emergency_stopped && row_width_px < COMPACT_STOPPED_ROW_WIDTH_THRESHOLD_PX);
+    let reserved_width_px = match (is_compact_row, snapshot.is_emergency_stopped) {
+        (true, true) => ROW_ONE_RESERVED_COMPACT_STOPPED_PX,
+        (true, false) => ROW_ONE_RESERVED_COMPACT_PX,
+        (false, true) => ROW_ONE_RESERVED_WIDE_STOPPED_PX,
+        (false, false) => ROW_ONE_RESERVED_WIDE_PX,
+    };
+    let desired_name_width_px = (row_width_px - reserved_width_px)
+        .clamp(SCRIPT_NAME_MIN_WIDTH_PX, SCRIPT_NAME_INPUT_WIDTH_PX);
+
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        render_inline_script_name_field(ui, script, emitted_actions);
-        render_mode_segmented_pill(ui, &mut script.mode, emitted_actions);
+        render_inline_script_name_field(ui, script, desired_name_width_px, emitted_actions);
+        render_mode_segmented_pill(ui, &mut script.mode, is_compact_row, emitted_actions);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             render_right_action_buttons(
@@ -136,6 +162,7 @@ fn render_empty_settings_bar(
 fn render_inline_script_name_field(
     ui: &mut Ui,
     script: &mut ScriptDocument,
+    desired_name_width_px: f32,
     emitted_actions: &mut Vec<SettingsBarAction>,
 ) {
     let name_edit_id = Id::unique(("script_header_name_edit", script.id.as_str()));
@@ -168,7 +195,7 @@ fn render_inline_script_name_field(
                         SCRIPT_NAME_FONT_SIZE_PX,
                         font_family_semibold(),
                     ))
-                    .desired_width(SCRIPT_NAME_INPUT_WIDTH_PX)
+                    .desired_width(desired_name_width_px)
                     .hint_text("Untitled script"),
             );
             if text_response.changed() {
@@ -185,8 +212,29 @@ fn render_inline_script_name_field(
 fn render_mode_segmented_pill(
     ui: &mut Ui,
     mode: &mut ScriptMode,
+    is_compact_row: bool,
     emitted_actions: &mut Vec<SettingsBarAction>,
 ) {
+    let mode_choices = if is_compact_row {
+        [
+            (ScriptMode::VisualBlocks, "Blocks", "Visual Blocks mode"),
+            (ScriptMode::AdvancedRust, "Rust", "Advanced Rust mode"),
+        ]
+    } else {
+        [
+            (
+                ScriptMode::VisualBlocks,
+                "Visual Blocks",
+                "Visual Blocks mode",
+            ),
+            (
+                ScriptMode::AdvancedRust,
+                "Advanced Rust",
+                "Advanced Rust mode",
+            ),
+        ]
+    };
+
     Frame::NONE
         .fill(BG_CANVAS)
         .stroke(Stroke::new(1.0, BORDER_SUBTLE))
@@ -195,10 +243,7 @@ fn render_mode_segmented_pill(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                for (candidate_mode, label_text) in [
-                    (ScriptMode::VisualBlocks, "Visual Blocks"),
-                    (ScriptMode::AdvancedRust, "Advanced Rust"),
-                ] {
+                for (candidate_mode, label_text, tooltip_text) in mode_choices {
                     let is_selected = *mode == candidate_mode;
                     let (label, fill, border) = if is_selected {
                         (
@@ -222,7 +267,13 @@ fn render_mode_segmented_pill(
                         SEGMENT_INNER_RADIUS_PX,
                         vec2(0.0, INLINE_STRIP_BUTTON_HEIGHT_PX),
                     );
-                    if ui.add(button).clicked() && !is_selected {
+                    let response = ui.add(button);
+                    let clicked = if is_compact_row {
+                        response.on_hover_text(tooltip_text).clicked()
+                    } else {
+                        response.clicked()
+                    };
+                    if clicked && !is_selected {
                         *mode = candidate_mode;
                         emitted_actions.push(SettingsBarAction::MarkActiveScriptDirty);
                     }
@@ -509,6 +560,7 @@ fn render_right_action_buttons(
     emitted_actions: &mut Vec<SettingsBarAction>,
 ) {
     render_stop_all_button(ui, snapshot.is_emergency_stopped, emitted_actions);
+    render_editor_live_status_pill(ui, script, validation_report, snapshot, emitted_actions);
 
     let first_issue = validation_report
         .issues
@@ -526,8 +578,9 @@ fn render_right_action_buttons(
     } else {
         ("Enable", SURFACE_ELEVATED, TEXT_PRIMARY, BORDER_STRONG)
     };
+    let can_toggle_enable = is_valid || script.is_enabled;
     let enable_response = ui.add_enabled(
-        is_valid,
+        can_toggle_enable,
         build_styled_button(
             rich_semibold(enable_label, FONT_SIZE_SMALL_PX, enable_ink),
             enable_fill,
@@ -541,8 +594,10 @@ fn render_right_action_buttons(
             !script.is_enabled,
         ));
     }
-    if !is_valid {
+    if !can_toggle_enable {
         enable_response.on_disabled_hover_text(format!("Cannot enable: {first_issue}"));
+    } else if !is_valid && script.is_enabled {
+        enable_response.on_hover_text(format!("Disable script (validation issue: {first_issue})"));
     }
 
     let (save_fill, save_ink, save_border) = if is_dirty && is_valid {
@@ -610,159 +665,6 @@ fn render_stop_all_button(
     {
         emitted_actions.push(SettingsBarAction::ClearEmergencyStop);
     }
-}
-
-fn render_emergency_stop_banner(
-    ui: &mut Ui,
-    emergency_stop_count: u64,
-    emitted_actions: &mut Vec<SettingsBarAction>,
-) {
-    Frame::NONE
-        .fill(STATUS_DANGER_TINT)
-        .stroke(Stroke::new(1.0, STATUS_DANGER))
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(rich_semibold(
-                    format!(
-                        "Emergency Stop active (count: {emergency_stop_count}). All scripts are halted and inputs released."
-                    ),
-                    FONT_SIZE_SMALL_PX,
-                    STATUS_DANGER_INK,
-                ));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(build_styled_button(
-                            rich_semibold("Clear Stop", FONT_SIZE_SMALL_PX, TEXT_PRIMARY),
-                            SURFACE_ELEVATED,
-                            BORDER_STRONG,
-                            CORNER_RADIUS_SM_PX,
-                            vec2(0.0, INLINE_STRIP_BUTTON_HEIGHT_PX),
-                        ))
-                        .clicked()
-                    {
-                        emitted_actions.push(SettingsBarAction::ClearEmergencyStop);
-                    }
-                });
-            });
-        });
-}
-
-fn render_inline_setup_strip(
-    ui: &mut Ui,
-    validation_report: &ValidationReport,
-    emitted_actions: &mut Vec<SettingsBarAction>,
-) {
-    let needs_kill_switch = validation_report.has_issue(ValidationIssueCode::MissingKillSwitchKey)
-        || has_kill_switch_collision(validation_report);
-    let needs_target = validation_report.has_issue(ValidationIssueCode::InvalidSelectedGameTarget);
-    let is_setup_only = validation_report.issues.iter().all(|issue| {
-        matches!(
-            issue.code,
-            ValidationIssueCode::MissingKillSwitchKey
-                | ValidationIssueCode::InvalidSelectedGameTarget
-        )
-    });
-
-    let (strip_fill, strip_border, badge_label, badge_fill, badge_ink, badge_border) =
-        if is_setup_only {
-            (
-                SURFACE_ELEVATED,
-                BORDER_STRONG,
-                "Setup",
-                ACCENT_PRIMARY_TINT,
-                ACCENT_PRIMARY,
-                ACCENT_PRIMARY,
-            )
-        } else {
-            (
-                STATUS_DANGER_TINT,
-                STATUS_DANGER,
-                "Safety Gate",
-                STATUS_DANGER_SOLID,
-                Color32::WHITE,
-                STATUS_DANGER_SOLID,
-            )
-        };
-
-    Frame::NONE
-        .fill(strip_fill)
-        .stroke(Stroke::new(1.0, strip_border))
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-        .inner_margin(Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                render_badge_pill(ui, badge_label, badge_fill, badge_ink, badge_border);
-                ui.label(
-                    RichText::new(build_concise_validation_summary(validation_report))
-                        .size(FONT_SIZE_SMALL_PX)
-                        .color(TEXT_PRIMARY),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if needs_target
-                        && ui
-                            .add(build_styled_button(
-                                rich_semibold("Attach Target", FONT_SIZE_SMALL_PX, TEXT_PRIMARY),
-                                SURFACE_HOVER,
-                                BORDER_STRONG,
-                                CORNER_RADIUS_SM_PX,
-                                vec2(0.0, INLINE_STRIP_BUTTON_HEIGHT_PX),
-                            ))
-                            .clicked()
-                    {
-                        emitted_actions.push(SettingsBarAction::OpenTargetPicker);
-                    }
-                    if needs_kill_switch
-                        && ui
-                            .add(build_styled_button(
-                                rich_semibold(
-                                    "Bind Kill-Switch",
-                                    FONT_SIZE_SMALL_PX,
-                                    ACCENT_PRIMARY,
-                                ),
-                                ACCENT_PRIMARY_TINT,
-                                ACCENT_PRIMARY,
-                                CORNER_RADIUS_SM_PX,
-                                vec2(0.0, INLINE_STRIP_BUTTON_HEIGHT_PX),
-                            ))
-                            .clicked()
-                    {
-                        emitted_actions.push(SettingsBarAction::BeginKeyCapture(
-                            KeyCaptureTarget::KillSwitch,
-                        ));
-                    }
-                });
-            });
-        });
-}
-
-fn has_kill_switch_collision(validation_report: &ValidationReport) -> bool {
-    validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey)
-        || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithArmToggleKey)
-        || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithEmittedKey)
-        || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithConditionKey)
-}
-
-fn build_concise_validation_summary(validation_report: &ValidationReport) -> String {
-    let mut parts: Vec<String> = validation_report
-        .issues
-        .iter()
-        .take(MAX_INLINE_VALIDATION_ISSUES)
-        .map(|issue| issue.message.clone())
-        .collect();
-    if validation_report.issues.len() > MAX_INLINE_VALIDATION_ISSUES {
-        let hidden_count = validation_report
-            .issues
-            .len()
-            .saturating_sub(MAX_INLINE_VALIDATION_ISSUES);
-        parts.push(format!("+{hidden_count} more"));
-    }
-    parts.join("; ")
 }
 
 fn paint_subtle_horizontal_divider(ui: &mut Ui) {

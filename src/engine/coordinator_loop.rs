@@ -32,6 +32,7 @@ pub(crate) struct CoordinatorLoop {
     supervisor: ScriptWorkerSupervisor,
     telemetry: CoordinatorTelemetryStore,
     current_intercept: Option<TriggerInterceptSpec>,
+    failed_intercept_attempt: Option<TriggerInterceptSpec>,
     input_sink: Arc<dyn InputSink>,
     physical_input: Arc<dyn PhysicalInputReader>,
     trigger_intercept: Arc<dyn TriggerInterceptControl>,
@@ -74,6 +75,7 @@ impl CoordinatorLoop {
             supervisor,
             telemetry,
             current_intercept: None,
+            failed_intercept_attempt: None,
             input_sink: config.input_sink,
             physical_input: config.physical_input,
             trigger_intercept: config.trigger_intercept,
@@ -165,6 +167,7 @@ impl CoordinatorLoop {
             CoordinatorCommand::ClearEmergencyStop => {
                 self.telemetry.clear_emergency_stop();
                 self.self_stopped_revision_by_id.clear();
+                self.failed_intercept_attempt = None;
                 self.telemetry.record_log(
                     TelemetryLevel::Info,
                     None,
@@ -180,6 +183,7 @@ impl CoordinatorLoop {
     }
 
     fn apply_sync_scripts(&mut self, incoming_scripts: Vec<ScriptDocument>) {
+        self.failed_intercept_attempt = None;
         let incoming_ids: Vec<String> = incoming_scripts
             .iter()
             .map(|item| item.id.clone())
@@ -650,25 +654,44 @@ impl CoordinatorLoop {
 
     fn apply_trigger_intercept(
         &mut self,
-        desired_spec: Option<TriggerInterceptSpec>,
+        desired_intercept: Option<TriggerInterceptSpec>,
         owner_script_id: Option<&str>,
     ) {
-        if self.current_intercept != desired_spec {
-            match self.trigger_intercept.set_intercept(desired_spec) {
-                Ok(()) => self.current_intercept = desired_spec,
-                Err(intercept_error) => {
-                    self.current_intercept = None;
-                    self.telemetry.record_log(
-                        TelemetryLevel::Warning,
-                        owner_script_id.map(ToString::to_string),
-                        format!("Trigger intercept update failed: {intercept_error}"),
-                    );
-                }
-            }
-            self.telemetry.mark_dirty();
-        }
+        self.reconcile_trigger_intercept(desired_intercept, owner_script_id);
         let is_grab_active = self.trigger_intercept.is_intercept_active();
         self.telemetry
             .update_intercept_flags(is_grab_active, owner_script_id);
+    }
+
+    fn reconcile_trigger_intercept(
+        &mut self,
+        desired_intercept: Option<TriggerInterceptSpec>,
+        owner_script_id: Option<&str>,
+    ) {
+        if desired_intercept.is_some() && desired_intercept == self.failed_intercept_attempt {
+            return;
+        }
+        if desired_intercept != self.failed_intercept_attempt {
+            self.failed_intercept_attempt = None;
+        }
+        if self.current_intercept == desired_intercept {
+            return;
+        }
+        match self.trigger_intercept.set_intercept(desired_intercept) {
+            Ok(()) => {
+                self.current_intercept = desired_intercept;
+                self.failed_intercept_attempt = None;
+            }
+            Err(intercept_error) => {
+                self.current_intercept = None;
+                self.failed_intercept_attempt = desired_intercept;
+                self.telemetry.record_log(
+                    TelemetryLevel::Warning,
+                    owner_script_id.map(ToString::to_string),
+                    format!("Trigger intercept update failed: {intercept_error}"),
+                );
+            }
+        }
+        self.telemetry.mark_dirty();
     }
 }

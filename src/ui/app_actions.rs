@@ -9,7 +9,8 @@ use crate::models::{
     CoordinatorCommand, GameTargetRule, ScriptDocument, ScriptMode, TargetScope, VisualProgram,
     inspect_script_validation,
 };
-use crate::ui::app::{ClickForgeWorkbenchApp, DeletedScriptUndoEntry};
+use crate::ui::active_dashboard::ActiveDashboardAction;
+use crate::ui::app::{ClickForgeWorkbenchApp, DeletedScriptUndoEntry, WorkbenchTab};
 use crate::ui::block_canvas::BlockCanvasAction;
 use crate::ui::block_palette::PaletteAction;
 use crate::ui::rust_editor_panel::RustEditorAction;
@@ -103,6 +104,10 @@ impl ClickForgeWorkbenchApp {
             return;
         }
 
+        if self.active_tab != WorkbenchTab::Editor {
+            return;
+        }
+
         let is_visual_mode = self
             .active_script_index()
             .is_some_and(|index| self.scripts[index].mode == ScriptMode::VisualBlocks);
@@ -154,10 +159,18 @@ impl ClickForgeWorkbenchApp {
     pub(crate) fn apply_sidebar_actions(&mut self, actions: Vec<SidebarAction>) {
         for action in actions {
             match action {
+                SidebarAction::SelectTab(target_tab) => {
+                    self.switch_workbench_tab(target_tab);
+                }
                 SidebarAction::SelectScript(script_id) => {
                     self.selected_script_id = Some(script_id);
                     self.active_key_capture = None;
                     self.coordinator.cancel_key_capture();
+                    self.persist_settings_quietly();
+                }
+                SidebarAction::OpenScriptInEditor(script_id) => {
+                    self.selected_script_id = Some(script_id);
+                    self.switch_workbench_tab(WorkbenchTab::Editor);
                     self.persist_settings_quietly();
                 }
                 SidebarAction::ToggleScriptEnabled {
@@ -197,15 +210,101 @@ impl ClickForgeWorkbenchApp {
         }
     }
 
-    pub(crate) fn apply_settings_bar_actions(&mut self, actions: Vec<SettingsBarAction>) {
+    pub(crate) fn apply_active_dashboard_actions(&mut self, actions: Vec<ActiveDashboardAction>) {
         for action in actions {
             match action {
-                SettingsBarAction::OpenTargetPicker => {
+                ActiveDashboardAction::SelectScript(script_id) => {
+                    self.selected_script_id = Some(script_id);
+                    self.persist_settings_quietly();
+                }
+                ActiveDashboardAction::EditScript(script_id) => {
+                    self.selected_script_id = Some(script_id);
+                    self.switch_workbench_tab(WorkbenchTab::Editor);
+                    self.persist_settings_quietly();
+                }
+                ActiveDashboardAction::OpenEditorTab => {
+                    self.switch_workbench_tab(WorkbenchTab::Editor);
+                }
+                ActiveDashboardAction::OpenNewScriptModal => {
+                    self.new_script_modal_state
+                        .open_with_defaults(self.scripts.len());
+                }
+                ActiveDashboardAction::OpenTargetPickerForScript(script_id) => {
+                    self.selected_script_id = Some(script_id);
+                    self.persist_settings_quietly();
+                    self.open_target_picker_dialog();
+                }
+                ActiveDashboardAction::ToggleScriptEnabled {
+                    script_id,
+                    is_enabled,
+                } => {
+                    self.set_script_enabled_by_id(&script_id, is_enabled);
+                }
+                ActiveDashboardAction::EmergencyStopAll => {
+                    let _ = self
+                        .coordinator
+                        .send_command(CoordinatorCommand::EmergencyStopAll {
+                            reason: "UI STOP ALL button".to_string(),
+                        });
+                    self.show_toast("Emergency stop triggered.", true);
+                }
+                ActiveDashboardAction::ClearEmergencyStop => {
+                    let _ = self
+                        .coordinator
+                        .send_command(CoordinatorCommand::ClearEmergencyStop);
+                    self.show_toast("Emergency stop cleared.", false);
+                }
+                ActiveDashboardAction::DisableAllScripts => {
+                    self.disable_all_scripts();
+                }
+                ActiveDashboardAction::RefreshFocusedWindow => {
                     self.window_watcher.refresh_now();
                     let _ = self
                         .coordinator
                         .send_command(CoordinatorCommand::RefreshWindowsAndProcesses);
-                    self.target_picker_state.open();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn disable_all_scripts(&mut self) {
+        for script in &mut self.scripts {
+            if !script.is_enabled {
+                continue;
+            }
+            script.is_enabled = false;
+            script.touch_updated_timestamp();
+            if inspect_script_validation(script).is_valid()
+                && self.repository.save_script(script).is_ok()
+            {
+                self.dirty_script_ids.remove(&script.id);
+            }
+        }
+        let _ = self
+            .coordinator
+            .send_command(CoordinatorCommand::DisableAllScripts);
+        self.show_toast("All scripts disabled.", false);
+    }
+
+    fn switch_workbench_tab(&mut self, target_tab: WorkbenchTab) {
+        self.active_tab = target_tab;
+        self.active_key_capture = None;
+        self.coordinator.cancel_key_capture();
+    }
+
+    fn open_target_picker_dialog(&mut self) {
+        self.window_watcher.refresh_now();
+        let _ = self
+            .coordinator
+            .send_command(CoordinatorCommand::RefreshWindowsAndProcesses);
+        self.target_picker_state.open();
+    }
+
+    pub(crate) fn apply_settings_bar_actions(&mut self, actions: Vec<SettingsBarAction>) {
+        for action in actions {
+            match action {
+                SettingsBarAction::OpenTargetPicker => {
+                    self.open_target_picker_dialog();
                 }
                 SettingsBarAction::SetScopeGlobal => {
                     if let Some(active_index) = self.active_script_index() {
@@ -236,6 +335,9 @@ impl ClickForgeWorkbenchApp {
                     if let Some(selected_id) = self.selected_script_id.clone() {
                         self.set_script_enabled_by_id(&selected_id, is_enabled);
                     }
+                }
+                SettingsBarAction::OpenActiveDashboard => {
+                    self.switch_workbench_tab(WorkbenchTab::Active);
                 }
                 SettingsBarAction::EmergencyStopAll => {
                     let _ = self
@@ -277,17 +379,19 @@ impl ClickForgeWorkbenchApp {
                         let target_name = target_rule.display_name.clone();
                         self.scripts[active_index].target_scope =
                             TargetScope::SelectedGame(target_rule);
-                        let script_id = self.scripts[active_index].id.clone();
-                        self.mark_script_dirty(&script_id);
-                        self.show_toast(format!("Attached target: {target_name}"), false);
+                        self.sync_target_change_for_active_script(
+                            active_index,
+                            format!("Attached target: {target_name}"),
+                        );
                     }
                 }
                 TargetPickerAction::SetScopeGlobal => {
                     if let Some(active_index) = self.active_script_index() {
                         self.scripts[active_index].target_scope = TargetScope::Global;
-                        let script_id = self.scripts[active_index].id.clone();
-                        self.mark_script_dirty(&script_id);
-                        self.show_toast("Switched script scope to Global.", false);
+                        self.sync_target_change_for_active_script(
+                            active_index,
+                            "Switched script scope to Global.".to_string(),
+                        );
                     }
                 }
             }
@@ -564,7 +668,29 @@ impl ClickForgeWorkbenchApp {
 
         self.scripts.push(new_script);
         self.selected_script_id = Some(new_script_id);
+        self.switch_workbench_tab(WorkbenchTab::Editor);
         self.persist_settings_quietly();
+    }
+
+    fn sync_target_change_for_active_script(&mut self, active_index: usize, toast_message: String) {
+        let script_id = self.scripts[active_index].id.clone();
+        if self.active_tab == WorkbenchTab::Active
+            && inspect_script_validation(&self.scripts[active_index]).is_valid()
+        {
+            self.scripts[active_index].touch_updated_timestamp();
+            let updated_script = self.scripts[active_index].clone();
+            if self.repository.save_script(&updated_script).is_ok() {
+                self.dirty_script_ids.remove(&script_id);
+            } else {
+                self.mark_script_dirty(&script_id);
+            }
+            let _ = self
+                .coordinator
+                .send_command(CoordinatorCommand::UpsertScript(updated_script));
+        } else {
+            self.mark_script_dirty(&script_id);
+        }
+        self.show_toast(toast_message, false);
     }
 
     fn duplicate_script_by_id(&mut self, script_id: &str) {

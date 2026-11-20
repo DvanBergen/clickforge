@@ -1,24 +1,31 @@
+mod new_script_modal;
+
 use std::collections::HashSet;
 
 use clickforge_sdk::KeyCode;
 use egui::{
-    Align, Checkbox, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Margin, Modal,
-    Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Theme, Ui, pos2, vec2,
+    Align, Checkbox, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin,
+    PointerButton, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
 use crate::models::{
-    CoordinatorSnapshot, ScriptDocument, ScriptExecutionPhase, ScriptMode, TargetScope,
+    CoordinatorSnapshot, ScriptDocument, ScriptExecutionPhase, TargetScope,
     inspect_script_validation,
 };
 use crate::storage::AppSettings;
+use crate::ui::app::WorkbenchTab;
 use crate::ui::theme::{
     ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE,
-    CORNER_RADIUS_MD_PX, CORNER_RADIUS_PILL_PX, CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX,
-    FONT_SIZE_HEADING_PX, FONT_SIZE_SMALL_PX, INK_ON_ACCENT, STATUS_DANGER, STATUS_DANGER_INK,
-    STATUS_DANGER_TINT, STATUS_INFO_INK, STATUS_RUNNING, STATUS_RUNNING_INK, STATUS_RUNNING_TINT,
-    SURFACE_ELEVATED, SURFACE_HOVER, SURFACE_PANEL, TEXT_MUTED, TEXT_PRIMARY, build_styled_button,
-    paint_status_dot, phase_status_color, render_badge_pill, rich_bold, rich_mono, rich_mono_bold,
-    rich_semibold, truncate_display_text,
+    CORNER_RADIUS_PILL_PX, CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX, FONT_SIZE_HEADING_PX,
+    FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_INK, STATUS_DANGER_TINT, STATUS_INFO_INK,
+    STATUS_RUNNING, STATUS_RUNNING_INK, STATUS_RUNNING_TINT, SURFACE_ELEVATED, SURFACE_HOVER,
+    SURFACE_PANEL, TEXT_MUTED, TEXT_PRIMARY, build_styled_button, font_family_mono_bold,
+    font_family_semibold, paint_status_dot, phase_status_color, rich_bold, rich_mono,
+    rich_mono_bold, rich_semibold, truncate_display_text,
+};
+
+pub use new_script_modal::{
+    NewScriptModalState, NewScriptTemplateChoice, render_new_script_modal, script_mode_for_template,
 };
 
 /// Default sidebar width in logical pixels.
@@ -34,75 +41,36 @@ const SELECTED_BAR_WIDTH_PX: f32 = 3.0;
 const SELECTED_BAR_INSET_Y_PX: f32 = 5.0;
 const ROW_ICON_SIZE_PX: f32 = 20.0;
 const FOOTER_RESERVED_HEIGHT_PX: f32 = 54.0;
+const TAB_SEGMENT_HEIGHT_PX: f32 = 30.0;
+const TAB_SEGMENT_GAP_PX: f32 = 3.0;
+const TAB_ACTIVE_WIDTH_RATIO: f32 = 0.60;
+const TAB_LABEL_FONT_SIZE_PX: f32 = 12.5;
+const TAB_BADGE_FONT_SIZE_PX: f32 = 10.0;
+const TAB_BADGE_HEIGHT_PX: f32 = 17.0;
+const TAB_BADGE_PADDING_X_PX: f32 = 5.0;
+const TAB_LABEL_TO_BADGE_GAP_PX: f32 = 5.0;
+const TAB_INNER_RADIUS_PX: u8 = CORNER_RADIUS_PILL_PX.saturating_sub(3);
 const MAX_SCRIPT_TITLE_CHARS: usize = 16;
 const MAX_SUBTITLE_IDLE_CHARS: usize = 18;
 const MAX_SUBTITLE_HOVERED_CHARS: usize = 11;
-const NEW_SCRIPT_MODAL_WIDTH_PX: f32 = 468.0;
 const ROW_HOVER_FILL: Color32 = Color32::from_rgb(0x26, 0x2C, 0x39);
 
-type BadgeColors = (Color32, Color32, Color32);
+pub(crate) type BadgeColors = (Color32, Color32, Color32);
 
 const BADGE_RUNNING: BadgeColors = (STATUS_RUNNING_TINT, STATUS_RUNNING_INK, STATUS_RUNNING);
-const BADGE_ACCENT: BadgeColors = (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, ACCENT_PRIMARY);
+pub(crate) const BADGE_ACCENT: BadgeColors = (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, ACCENT_PRIMARY);
 const BADGE_DANGER: BadgeColors = (STATUS_DANGER_TINT, STATUS_DANGER_INK, STATUS_DANGER);
 const BADGE_INFO: BadgeColors = (SURFACE_PANEL, STATUS_INFO_INK, BORDER_STRONG);
 const BADGE_MUTED: BadgeColors = (SURFACE_PANEL, TEXT_MUTED, BORDER_SUBTLE);
 const BADGE_OFF: BadgeColors = (BG_CANVAS, TEXT_MUTED, BORDER_SUBTLE);
-const BADGE_HOVER_ACTION: BadgeColors = (SURFACE_HOVER, TEXT_PRIMARY, BORDER_STRONG);
-
-const KILL_SWITCH_QUICK_PICKS: [(Option<KeyCode>, &str); 5] = [
-    (Some(KeyCode::F8), "F8"),
-    (Some(KeyCode::Pause), "Pause"),
-    (Some(KeyCode::ScrollLock), "ScrollLock"),
-    (Some(KeyCode::F9), "F9"),
-    (None, "Bind Later"),
-];
-
-const TEMPLATE_CHOICES: [(NewScriptTemplateChoice, &str); 3] = [
-    (NewScriptTemplateChoice::VisualBlocks, "Visual Blocks"),
-    (NewScriptTemplateChoice::AdvancedRust, "Advanced Rust"),
-    (
-        NewScriptTemplateChoice::BuildingUpgradeTemplate,
-        "Building Upgrade Template",
-    ),
-];
-
-/// Authoring template option selected inside the New Script modal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NewScriptTemplateChoice {
-    #[default]
-    VisualBlocks,
-    AdvancedRust,
-    BuildingUpgradeTemplate,
-}
-
-/// Transient form state for the New Script creation modal.
-#[derive(Debug, Clone, Default)]
-pub struct NewScriptModalState {
-    pub is_open: bool,
-    pub script_name: String,
-    pub is_selected_game_scope: bool,
-    pub template_choice: NewScriptTemplateChoice,
-    pub selected_kill_switch_key: Option<KeyCode>,
-    should_focus_name_input: bool,
-}
-
-impl NewScriptModalState {
-    /// Resets form fields with no auto-filled Kill-Switch and opens the modal dialog.
-    pub fn open_with_defaults(&mut self, existing_script_count: usize) {
-        self.script_name = format!("New Script {}", existing_script_count.saturating_add(1));
-        self.is_selected_game_scope = true;
-        self.template_choice = NewScriptTemplateChoice::VisualBlocks;
-        self.selected_kill_switch_key = None;
-        self.should_focus_name_input = true;
-        self.is_open = true;
-    }
-}
+pub(crate) const BADGE_HOVER_ACTION: BadgeColors = (SURFACE_HOVER, TEXT_PRIMARY, BORDER_STRONG);
 
 /// User actions emitted by the left script sidebar and New Script modal.
 #[derive(Debug, Clone)]
 pub enum SidebarAction {
+    SelectTab(WorkbenchTab),
     SelectScript(String),
+    OpenScriptInEditor(String),
     ToggleScriptEnabled {
         script_id: String,
         is_enabled: bool,
@@ -121,6 +89,7 @@ pub enum SidebarAction {
 
 /// Read-only projection passed into `render_sidebar`.
 pub struct SidebarViewModel<'frame> {
+    pub active_tab: WorkbenchTab,
     pub scripts: &'frame [ScriptDocument],
     pub selected_script_id: Option<&'frame str>,
     pub dirty_script_ids: &'frame HashSet<String>,
@@ -129,13 +98,13 @@ pub struct SidebarViewModel<'frame> {
     pub has_system_tray: bool,
 }
 
-/// Renders the full-height left script rail grouped into Selected Game and Global sections.
+/// Renders the full-height left script rail with Active/Editor tabs and grouped scripts.
 pub fn render_sidebar(
     ui: &mut Ui,
     view_model: &SidebarViewModel<'_>,
     emitted_actions: &mut Vec<SidebarAction>,
 ) {
-    render_sidebar_header(ui, view_model.snapshot, emitted_actions);
+    render_sidebar_header(ui, view_model, emitted_actions);
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
@@ -175,7 +144,7 @@ pub fn render_sidebar(
 
 fn render_sidebar_header(
     ui: &mut Ui,
-    snapshot: &CoordinatorSnapshot,
+    view_model: &SidebarViewModel<'_>,
     emitted_actions: &mut Vec<SidebarAction>,
 ) {
     ui.horizontal(|ui| {
@@ -204,11 +173,14 @@ fn render_sidebar_header(
         ));
         ui.label(rich_bold("ClickForge", FONT_SIZE_HEADING_PX, TEXT_PRIMARY));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            render_engine_status_pill(ui, snapshot);
+            render_engine_status_pill(ui, view_model.snapshot);
         });
     });
 
     ui.add_space(10.0);
+    render_workspace_tab_switcher(ui, view_model, emitted_actions);
+
+    ui.add_space(8.0);
     let new_button = build_styled_button(
         rich_semibold("+ New Script", FONT_SIZE_BODY_PX, TEXT_PRIMARY),
         SURFACE_ELEVATED,
@@ -219,6 +191,183 @@ fn render_sidebar_header(
     if ui.add(new_button).clicked() {
         emitted_actions.push(SidebarAction::OpenNewScriptModal);
     }
+}
+
+fn render_workspace_tab_switcher(
+    ui: &mut Ui,
+    view_model: &SidebarViewModel<'_>,
+    emitted_actions: &mut Vec<SidebarAction>,
+) {
+    let (active_pill_text, active_pill_colors) =
+        compute_active_tab_pill(view_model.scripts, view_model.snapshot);
+
+    Frame::NONE
+        .fill(BG_CANVAS)
+        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let inner_width_px = ui.available_width();
+            let active_width_px =
+                ((inner_width_px - TAB_SEGMENT_GAP_PX) * TAB_ACTIVE_WIDTH_RATIO).max(102.0);
+            let editor_width_px = (inner_width_px - TAB_SEGMENT_GAP_PX - active_width_px).max(58.0);
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = TAB_SEGMENT_GAP_PX;
+                let active_response = render_tab_segment(
+                    ui,
+                    active_width_px,
+                    "Active",
+                    Some((&active_pill_text, active_pill_colors)),
+                    view_model.active_tab == WorkbenchTab::Active,
+                    "Live Control Center showing running, armed, and waiting scripts",
+                );
+                if active_response.clicked() && view_model.active_tab != WorkbenchTab::Active {
+                    emitted_actions.push(SidebarAction::SelectTab(WorkbenchTab::Active));
+                }
+
+                let editor_response = render_tab_segment(
+                    ui,
+                    editor_width_px,
+                    "Editor",
+                    None,
+                    view_model.active_tab == WorkbenchTab::Editor,
+                    "Edit Visual Blocks or Advanced Rust code for the selected script",
+                );
+                if editor_response.clicked() && view_model.active_tab != WorkbenchTab::Editor {
+                    emitted_actions.push(SidebarAction::SelectTab(WorkbenchTab::Editor));
+                }
+            });
+        });
+}
+
+fn compute_active_tab_pill(
+    scripts: &[ScriptDocument],
+    snapshot: &CoordinatorSnapshot,
+) -> (String, BadgeColors) {
+    if snapshot.is_emergency_stopped {
+        return ("STOPPED".to_string(), BADGE_DANGER);
+    }
+    let enabled_count = scripts.iter().filter(|script| script.is_enabled).count();
+    if enabled_count == 0 {
+        return ("0".to_string(), BADGE_MUTED);
+    }
+
+    let has_running_or_armed = scripts
+        .iter()
+        .filter(|script| script.is_enabled)
+        .any(|script| {
+            matches!(
+                snapshot
+                    .status_for_script(&script.id)
+                    .map(|status| status.phase),
+                Some(ScriptExecutionPhase::Running | ScriptExecutionPhase::Armed)
+            )
+        });
+    if has_running_or_armed {
+        return (format!("{enabled_count} ON"), BADGE_RUNNING);
+    }
+
+    let has_error = scripts
+        .iter()
+        .filter(|script| script.is_enabled)
+        .any(|script| {
+            snapshot
+                .status_for_script(&script.id)
+                .is_some_and(|status| status.phase == ScriptExecutionPhase::Error)
+        });
+    if has_error {
+        return (format!("{enabled_count} ERR"), BADGE_DANGER);
+    }
+
+    (format!("{enabled_count} ON"), BADGE_ACCENT)
+}
+
+fn render_tab_segment(
+    ui: &mut Ui,
+    segment_width_px: f32,
+    label_text: &str,
+    badge: Option<(&str, BadgeColors)>,
+    is_selected: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let (segment_rect, response) = ui.allocate_exact_size(
+        vec2(segment_width_px, TAB_SEGMENT_HEIGHT_PX),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+
+    let (bg_fill, border_color, label_ink) = if is_selected {
+        (SURFACE_HOVER, ACCENT_PRIMARY, TEXT_PRIMARY)
+    } else if response.hovered() {
+        (ROW_HOVER_FILL, BORDER_SUBTLE, TEXT_PRIMARY)
+    } else {
+        (Color32::TRANSPARENT, Color32::TRANSPARENT, TEXT_MUTED)
+    };
+
+    let painter = ui.painter();
+    let border_stroke = if border_color == Color32::TRANSPARENT {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, border_color)
+    };
+    painter.rect(
+        segment_rect,
+        CornerRadius::same(TAB_INNER_RADIUS_PX),
+        bg_fill,
+        border_stroke,
+        StrokeKind::Inside,
+    );
+
+    let label_font = FontId::new(TAB_LABEL_FONT_SIZE_PX, font_family_semibold());
+    let label_galley = painter.layout_no_wrap(label_text.to_string(), label_font, label_ink);
+    let center_y_px = segment_rect.center().y;
+
+    if let Some((badge_text, (badge_fill, badge_ink, badge_border))) = badge {
+        let badge_font = FontId::new(TAB_BADGE_FONT_SIZE_PX, font_family_mono_bold());
+        let badge_galley = painter.layout_no_wrap(badge_text.to_string(), badge_font, badge_ink);
+        let badge_width_px = badge_galley.size().x + TAB_BADGE_PADDING_X_PX * 2.0;
+        let total_content_width_px =
+            label_galley.size().x + TAB_LABEL_TO_BADGE_GAP_PX + badge_width_px;
+        let content_start_x_px =
+            (segment_rect.center().x - total_content_width_px * 0.5).max(segment_rect.left() + 6.0);
+
+        let label_pos = pos2(
+            content_start_x_px,
+            center_y_px - label_galley.size().y * 0.5,
+        );
+        let badge_left_x_px =
+            content_start_x_px + label_galley.size().x + TAB_LABEL_TO_BADGE_GAP_PX;
+        let badge_rect = Rect::from_min_size(
+            pos2(badge_left_x_px, center_y_px - TAB_BADGE_HEIGHT_PX * 0.5),
+            vec2(badge_width_px, TAB_BADGE_HEIGHT_PX),
+        );
+        let badge_text_pos = pos2(
+            badge_rect.left() + TAB_BADGE_PADDING_X_PX,
+            center_y_px - badge_galley.size().y * 0.5,
+        );
+
+        painter.galley(label_pos, label_galley, label_ink);
+        painter.rect(
+            badge_rect,
+            CornerRadius::same(CORNER_RADIUS_SM_PX),
+            badge_fill,
+            Stroke::new(1.0, badge_border),
+            StrokeKind::Inside,
+        );
+        painter.galley(badge_text_pos, badge_galley, badge_ink);
+    } else {
+        let label_pos = pos2(
+            segment_rect.center().x - label_galley.size().x * 0.5,
+            center_y_px - label_galley.size().y * 0.5,
+        );
+        painter.galley(label_pos, label_galley, label_ink);
+    }
+
+    response.on_hover_text(tooltip)
 }
 
 fn render_engine_status_pill(ui: &mut Ui, snapshot: &CoordinatorSnapshot) {
@@ -321,11 +470,16 @@ fn render_script_row(
     let is_dirty = view_model.dirty_script_ids.contains(&script.id);
     let validation_report = inspect_script_validation(script);
     let is_valid = validation_report.is_valid();
-    let runtime_phase = view_model
-        .snapshot
-        .status_for_script(&script.id)
+    let runtime_status = view_model.snapshot.status_for_script(&script.id);
+    let runtime_phase = runtime_status
         .map(|status| status.phase)
         .unwrap_or(ScriptExecutionPhase::Disabled);
+    let is_arm_toggle_off = script.is_enabled
+        && script.arm_toggle_key.is_some()
+        && !view_model.snapshot.is_emergency_stopped
+        && runtime_status.is_some_and(|status| {
+            status.phase == ScriptExecutionPhase::Disabled && !status.is_armed_by_toggle
+        });
 
     let rect_memory_id = Id::unique(("sidebar_script_row_rect", script.id.as_str()));
     let is_row_hovered = ui
@@ -368,8 +522,9 @@ fn render_script_row(
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mut is_enabled = script.is_enabled;
+                    let can_toggle = is_valid || script.is_enabled;
                     let checkbox =
-                        ui.add_enabled(is_valid, Checkbox::without_text(&mut is_enabled));
+                        ui.add_enabled(can_toggle, Checkbox::without_text(&mut is_enabled));
                     did_click_inner |= checkbox.clicked() || checkbox.changed();
                     if checkbox.changed() {
                         emitted_actions.push(SidebarAction::ToggleScriptEnabled {
@@ -377,8 +532,12 @@ fn render_script_row(
                             is_enabled,
                         });
                     }
-                    if !is_valid {
+                    if !can_toggle {
                         checkbox.on_disabled_hover_text(format!("Blocked: {first_issue}"));
+                    } else if !is_valid && script.is_enabled {
+                        checkbox.on_hover_text(format!(
+                            "Disable script (validation issue: {first_issue})"
+                        ));
                     } else {
                         checkbox.on_hover_text("Enable or disable this script in background");
                     }
@@ -387,7 +546,12 @@ fn render_script_row(
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let (badge_text, badge_colors) = phase_badge_spec(runtime_phase, is_valid);
+                let (badge_text, badge_colors) = phase_badge_spec(
+                    runtime_phase,
+                    is_valid,
+                    script.is_enabled && view_model.snapshot.is_emergency_stopped,
+                    is_arm_toggle_off,
+                );
                 render_mono_badge(
                     ui,
                     badge_text,
@@ -438,7 +602,15 @@ fn render_script_row(
 
     if ui.rect_contains_pointer(row_rect) && !did_click_inner {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        if ui.ctx().input(|input| input.pointer.primary_clicked()) {
+        let (is_double_clicked, is_single_clicked) = ui.ctx().input(|input| {
+            (
+                input.pointer.button_double_clicked(PointerButton::Primary),
+                input.pointer.primary_clicked(),
+            )
+        });
+        if is_double_clicked {
+            emitted_actions.push(SidebarAction::OpenScriptInEditor(script.id.clone()));
+        } else if is_single_clicked {
             emitted_actions.push(SidebarAction::SelectScript(script.id.clone()));
         }
     }
@@ -464,14 +636,25 @@ fn render_row_hover_actions(
     did_click
 }
 
-fn phase_badge_spec(phase: ScriptExecutionPhase, is_valid: bool) -> (&'static str, BadgeColors) {
+fn phase_badge_spec(
+    phase: ScriptExecutionPhase,
+    is_valid: bool,
+    is_emergency_stopped: bool,
+    is_arm_toggle_off: bool,
+) -> (&'static str, BadgeColors) {
+    if is_emergency_stopped {
+        return ("STOP", BADGE_DANGER);
+    }
     if !is_valid {
         return ("SETUP", BADGE_ACCENT);
     }
+    if is_arm_toggle_off {
+        return ("ARM OFF", BADGE_ACCENT);
+    }
     match phase {
         ScriptExecutionPhase::Running => ("RUN", BADGE_RUNNING),
-        ScriptExecutionPhase::Armed => ("ARMED", BADGE_ACCENT),
-        ScriptExecutionPhase::WaitingForFocus => ("WAIT", BADGE_MUTED),
+        ScriptExecutionPhase::Armed => ("ARMED", BADGE_RUNNING),
+        ScriptExecutionPhase::WaitingForFocus => ("WAIT", BADGE_ACCENT),
         ScriptExecutionPhase::Compiling => ("BUILD", BADGE_INFO),
         ScriptExecutionPhase::StoppedByKillSwitch => ("STOP", BADGE_DANGER),
         ScriptExecutionPhase::Error => ("ERR", BADGE_DANGER),
@@ -544,234 +727,4 @@ fn render_row_icon_button(
         painter.rect_stroke(front, CornerRadius::same(1), stroke, StrokeKind::Inside);
     }
     response.on_hover_text(tooltip).clicked()
-}
-
-/// Renders the modal dialog for creating a new script with explicit Kill-Switch selection.
-pub fn render_new_script_modal(
-    egui_context: &egui::Context,
-    modal_state: &mut NewScriptModalState,
-    emitted_actions: &mut Vec<SidebarAction>,
-) {
-    if !modal_state.is_open {
-        return;
-    }
-
-    let modal_frame = Frame::NONE
-        .fill(SURFACE_PANEL)
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_MD_PX))
-        .shadow(egui_context.style_of(Theme::Dark).visuals.window_shadow)
-        .inner_margin(Margin::same(18));
-
-    let modal_response = Modal::new(Id::unique("new_script_modal"))
-        .frame(modal_frame)
-        .show(egui_context, |ui| {
-            ui.set_width(NEW_SCRIPT_MODAL_WIDTH_PX);
-            ui.label(rich_bold(
-                "Create New Script",
-                FONT_SIZE_HEADING_PX,
-                TEXT_PRIMARY,
-            ));
-            render_modal_field_label(ui, "Script Name");
-            let name_response = ui.add(
-                TextEdit::singleline(&mut modal_state.script_name)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Enter script name"),
-            );
-            if modal_state.should_focus_name_input {
-                name_response.request_focus();
-                modal_state.should_focus_name_input = false;
-            }
-
-            render_modal_field_label(ui, "Execution Scope");
-            ui.horizontal(|ui| {
-                for (is_game, label_text) in
-                    [(true, "Selected Game Only"), (false, "Global (Any Window)")]
-                {
-                    if render_choice_chip(
-                        ui,
-                        label_text,
-                        modal_state.is_selected_game_scope == is_game,
-                    ) {
-                        modal_state.is_selected_game_scope = is_game;
-                    }
-                }
-            });
-
-            render_modal_field_label(ui, "Starting Mode");
-            ui.horizontal(|ui| {
-                for (option, label_text) in TEMPLATE_CHOICES {
-                    if render_choice_chip(ui, label_text, modal_state.template_choice == option) {
-                        modal_state.template_choice = option;
-                    }
-                }
-            });
-
-            ui.add_space(12.0);
-            render_kill_switch_quick_picker(ui, &mut modal_state.selected_kill_switch_key);
-
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(10.0);
-            render_new_script_footer_buttons(ui, modal_state, emitted_actions);
-        });
-
-    if modal_response.should_close() {
-        modal_state.is_open = false;
-    }
-}
-
-fn render_modal_field_label(ui: &mut Ui, label_text: &str) {
-    ui.add_space(10.0);
-    ui.label(rich_semibold(label_text, FONT_SIZE_SMALL_PX, TEXT_MUTED));
-    ui.add_space(3.0);
-}
-
-fn render_kill_switch_quick_picker(ui: &mut Ui, selected_kill_switch_key: &mut Option<KeyCode>) {
-    ui.horizontal(|ui| {
-        ui.label(rich_semibold(
-            "Hard Kill-Switch Key",
-            FONT_SIZE_SMALL_PX,
-            TEXT_MUTED,
-        ));
-        render_badge_pill(
-            ui,
-            "Required before Save / Enable",
-            SURFACE_ELEVATED,
-            TEXT_MUTED,
-            BORDER_SUBTLE,
-        );
-    });
-    ui.add_space(4.0);
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        for (candidate_key, chip_label) in KILL_SWITCH_QUICK_PICKS {
-            let is_selected = *selected_kill_switch_key == candidate_key;
-            let (fill, ink, border) = match (is_selected, candidate_key.is_some()) {
-                (true, true) => BADGE_ACCENT,
-                (true, false) => BADGE_HOVER_ACTION,
-                (false, _) => (SURFACE_ELEVATED, TEXT_MUTED, BORDER_SUBTLE),
-            };
-            let label = if candidate_key.is_some() {
-                rich_mono_bold(chip_label, FONT_SIZE_SMALL_PX, ink)
-            } else {
-                rich_semibold(chip_label, FONT_SIZE_SMALL_PX, ink)
-            };
-            if ui
-                .add(build_styled_button(
-                    label,
-                    fill,
-                    border,
-                    CORNER_RADIUS_PILL_PX,
-                    vec2(0.0, 26.0),
-                ))
-                .clicked()
-            {
-                *selected_kill_switch_key = candidate_key;
-            }
-        }
-    });
-
-    ui.add_space(4.0);
-    let (helper_text, helper_color) = match selected_kill_switch_key {
-        Some(chosen_key) => (
-            format!(
-                "Pressing {} immediately stops all scripts and releases every input.",
-                chosen_key.display_label()
-            ),
-            STATUS_RUNNING_INK,
-        ),
-        None => (
-            "No Kill-Switch selected. Save, Compile, and Enable stay blocked until one is bound."
-                .to_string(),
-            TEXT_MUTED,
-        ),
-    };
-    ui.label(
-        RichText::new(helper_text)
-            .size(FONT_SIZE_SMALL_PX)
-            .color(helper_color),
-    );
-}
-
-fn render_choice_chip(ui: &mut Ui, label_text: &str, is_selected: bool) -> bool {
-    let (fill, border, label) = if is_selected {
-        (
-            SURFACE_HOVER,
-            ACCENT_PRIMARY,
-            rich_semibold(label_text, FONT_SIZE_SMALL_PX, TEXT_PRIMARY),
-        )
-    } else {
-        (
-            SURFACE_ELEVATED,
-            BORDER_SUBTLE,
-            RichText::new(label_text)
-                .size(FONT_SIZE_SMALL_PX)
-                .color(TEXT_MUTED),
-        )
-    };
-    ui.add(build_styled_button(
-        label,
-        fill,
-        border,
-        CORNER_RADIUS_SM_PX,
-        vec2(0.0, 26.0),
-    ))
-    .clicked()
-}
-
-fn render_new_script_footer_buttons(
-    ui: &mut Ui,
-    modal_state: &mut NewScriptModalState,
-    emitted_actions: &mut Vec<SidebarAction>,
-) {
-    let trimmed_name = modal_state.script_name.trim().to_string();
-    let can_create = !trimmed_name.is_empty();
-    let mut should_submit = can_create && ui.ctx().input(|input| input.key_pressed(Key::Enter));
-
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let (fill, ink) = if can_create {
-            (ACCENT_PRIMARY, INK_ON_ACCENT)
-        } else {
-            (SURFACE_ELEVATED, TEXT_MUTED)
-        };
-        let create = build_styled_button(
-            rich_semibold("Create Script", FONT_SIZE_BODY_PX, ink),
-            fill,
-            Color32::TRANSPARENT,
-            CORNER_RADIUS_SM_PX,
-            vec2(110.0, 30.0),
-        );
-        should_submit |= ui.add_enabled(can_create, create).clicked();
-        let cancel = build_styled_button(
-            rich_semibold("Cancel", FONT_SIZE_BODY_PX, TEXT_PRIMARY),
-            SURFACE_ELEVATED,
-            BORDER_SUBTLE,
-            CORNER_RADIUS_SM_PX,
-            vec2(74.0, 30.0),
-        );
-        if ui.add(cancel).clicked() {
-            modal_state.is_open = false;
-        }
-    });
-
-    if should_submit {
-        emitted_actions.push(SidebarAction::CreateScript {
-            name: trimmed_name,
-            is_selected_game_scope: modal_state.is_selected_game_scope,
-            template_choice: modal_state.template_choice,
-            kill_switch_key: modal_state.selected_kill_switch_key,
-        });
-        modal_state.is_open = false;
-    }
-}
-
-/// Maps `NewScriptTemplateChoice` to its underlying `ScriptMode`.
-pub fn script_mode_for_template(template_choice: NewScriptTemplateChoice) -> ScriptMode {
-    match template_choice {
-        NewScriptTemplateChoice::VisualBlocks
-        | NewScriptTemplateChoice::BuildingUpgradeTemplate => ScriptMode::VisualBlocks,
-        NewScriptTemplateChoice::AdvancedRust => ScriptMode::AdvancedRust,
-    }
 }

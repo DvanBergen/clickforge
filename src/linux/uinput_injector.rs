@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::path::Path;
 use std::sync::Mutex;
 
 use clickforge_sdk::{KeyCode, MouseButton};
@@ -17,6 +18,9 @@ use crate::linux::evdev_keymap::{
 use crate::models::runtime_contracts::{InputError, InputSink};
 
 const UINPUT_DEVICE_PATH: &str = "/dev/uinput";
+const KERNEL_RELEASE_FILE_PATH: &str = "/proc/sys/kernel/osrelease";
+const KERNEL_MODULES_ROOT_PATH: &str = "/lib/modules";
+const LINUX_ERRNO_ENODEV: i32 = 19;
 const HI_RES_WHEEL_UNITS_PER_DETENT: i32 = 120;
 const KEY_STATE_RELEASED: i32 = 0;
 const KEY_STATE_PRESSED: i32 = 1;
@@ -289,6 +293,18 @@ fn emit_release_batch(
 }
 
 fn map_uinput_open_error(io_error: io::Error) -> InputError {
+    map_uinput_open_error_with_paths(
+        io_error,
+        Path::new(KERNEL_RELEASE_FILE_PATH),
+        Path::new(KERNEL_MODULES_ROOT_PATH),
+    )
+}
+
+fn map_uinput_open_error_with_paths(
+    io_error: io::Error,
+    kernel_release_file_path: &Path,
+    modules_root_path: &Path,
+) -> InputError {
     if io_error.kind() == io::ErrorKind::PermissionDenied {
         return InputError::PermissionDenied {
             path: UINPUT_DEVICE_PATH.to_string(),
@@ -297,9 +313,39 @@ fn map_uinput_open_error(io_error: io::Error) -> InputError {
             ),
         };
     }
+    if io_error.raw_os_error() == Some(LINUX_ERRNO_ENODEV) {
+        return InputError::DeviceUnavailable {
+            detail: format_uinput_enodev_detail(kernel_release_file_path, modules_root_path),
+        };
+    }
     InputError::DeviceUnavailable {
         detail: format!("Could not open {UINPUT_DEVICE_PATH}: {io_error}"),
     }
+}
+
+fn format_uinput_enodev_detail(
+    kernel_release_file_path: &Path,
+    modules_root_path: &Path,
+) -> String {
+    if let Some(kernel_release) = read_trimmed_kernel_release(kernel_release_file_path)
+        && !modules_root_path.join(&kernel_release).exists()
+    {
+        return format!(
+            "Kernel module directory {KERNEL_MODULES_ROOT_PATH}/{kernel_release} is missing (likely after a kernel update). Reboot once to load the updated kernel and uinput module."
+        );
+    }
+    format!(
+        "{UINPUT_DEVICE_PATH} kernel module is not loaded (No such device). Run 'sudo modprobe uinput' or 'sudo scripts/install_udev_rules.sh'."
+    )
+}
+
+fn read_trimmed_kernel_release(kernel_release_file_path: &Path) -> Option<String> {
+    let raw_release = std::fs::read_to_string(kernel_release_file_path).ok()?;
+    let trimmed_release = raw_release.trim();
+    if trimmed_release.is_empty() {
+        return None;
+    }
+    Some(trimmed_release.to_string())
 }
 
 fn map_uinput_setup_error(io_error: io::Error) -> InputError {
@@ -329,5 +375,116 @@ mod tests {
         assert!(axes.contains(RelativeAxisCode::REL_Y));
         assert!(axes.contains(RelativeAxisCode::REL_WHEEL));
         assert!(axes.contains(RelativeAxisCode::REL_HWHEEL));
+    }
+
+    #[test]
+    fn map_uinput_open_error_reports_reboot_guidance_when_kernel_modules_directory_is_missing()
+    -> Result<(), String> {
+        let test_root = std::env::temp_dir().join(format!(
+            "clickforge-uinput-missing-modules-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_root);
+        let modules_root = test_root.join("modules");
+        std::fs::create_dir_all(&modules_root).map_err(|io_error| io_error.to_string())?;
+        let osrelease_file = test_root.join("osrelease");
+        std::fs::write(&osrelease_file, "6.19.1-test-kernel\n")
+            .map_err(|io_error| io_error.to_string())?;
+
+        let mapped_error = map_uinput_open_error_with_paths(
+            io::Error::from_raw_os_error(LINUX_ERRNO_ENODEV),
+            &osrelease_file,
+            &modules_root,
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
+
+        match mapped_error {
+            InputError::DeviceUnavailable { detail } => {
+                assert_eq!(
+                    detail,
+                    "Kernel module directory /lib/modules/6.19.1-test-kernel is missing (likely after a kernel update). Reboot once to load the updated kernel and uinput module."
+                );
+                Ok(())
+            }
+            other_error => Err(format!("expected DeviceUnavailable, got {other_error:?}")),
+        }
+    }
+
+    #[test]
+    fn map_uinput_open_error_reports_modprobe_guidance_when_kernel_modules_directory_exists()
+    -> Result<(), String> {
+        let test_root = std::env::temp_dir().join(format!(
+            "clickforge-uinput-present-modules-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&test_root);
+        let modules_root = test_root.join("modules");
+        let release_directory = modules_root.join("6.19.1-test-kernel");
+        std::fs::create_dir_all(&release_directory).map_err(|io_error| io_error.to_string())?;
+        let osrelease_file = test_root.join("osrelease");
+        std::fs::write(&osrelease_file, "6.19.1-test-kernel\n")
+            .map_err(|io_error| io_error.to_string())?;
+
+        let mapped_error = map_uinput_open_error_with_paths(
+            io::Error::from_raw_os_error(LINUX_ERRNO_ENODEV),
+            &osrelease_file,
+            &modules_root,
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
+
+        match mapped_error {
+            InputError::DeviceUnavailable { detail } => {
+                assert_eq!(
+                    detail,
+                    "/dev/uinput kernel module is not loaded (No such device). Run 'sudo modprobe uinput' or 'sudo scripts/install_udev_rules.sh'."
+                );
+                Ok(())
+            }
+            other_error => Err(format!("expected DeviceUnavailable, got {other_error:?}")),
+        }
+    }
+
+    #[test]
+    fn map_uinput_open_error_falls_back_to_modprobe_guidance_when_osrelease_is_unreadable()
+    -> Result<(), String> {
+        let missing_osrelease = std::env::temp_dir().join(format!(
+            "clickforge-uinput-no-osrelease-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing_osrelease);
+        let mapped_error = map_uinput_open_error_with_paths(
+            io::Error::from_raw_os_error(LINUX_ERRNO_ENODEV),
+            &missing_osrelease,
+            Path::new(KERNEL_MODULES_ROOT_PATH),
+        );
+
+        match mapped_error {
+            InputError::DeviceUnavailable { detail } => {
+                assert_eq!(
+                    detail,
+                    "/dev/uinput kernel module is not loaded (No such device). Run 'sudo modprobe uinput' or 'sudo scripts/install_udev_rules.sh'."
+                );
+                Ok(())
+            }
+            other_error => Err(format!("expected DeviceUnavailable, got {other_error:?}")),
+        }
+    }
+
+    #[test]
+    fn map_uinput_open_error_preserves_permission_denied_guidance() -> Result<(), String> {
+        let mapped_error = map_uinput_open_error_with_paths(
+            io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+            Path::new(KERNEL_RELEASE_FILE_PATH),
+            Path::new(KERNEL_MODULES_ROOT_PATH),
+        );
+
+        match mapped_error {
+            InputError::PermissionDenied { path, detail } => {
+                assert_eq!(path, UINPUT_DEVICE_PATH);
+                assert!(detail.contains("scripts/install_udev_rules.sh"));
+                Ok(())
+            }
+            other_error => Err(format!("expected PermissionDenied, got {other_error:?}")),
+        }
     }
 }

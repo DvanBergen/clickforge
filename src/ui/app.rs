@@ -19,6 +19,9 @@ use crate::models::{
 };
 use crate::storage::{AppSettings, ScriptRepository, SettingsStore};
 use crate::tray::SystemTrayHandle;
+use crate::ui::active_dashboard::{
+    ActiveDashboardViewModel, render_active_dashboard, render_uinput_offline_banner,
+};
 use crate::ui::app_actions::VisualProgramHistory;
 use crate::ui::block_canvas::{BlockCanvasAction, render_block_canvas};
 use crate::ui::block_palette::{
@@ -73,8 +76,17 @@ pub(crate) struct DeletedScriptUndoEntry {
     pub(crate) expires_at: Instant,
 }
 
+/// Top-level workspace tab switching between the live control center and script editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkbenchTab {
+    #[default]
+    Active,
+    Editor,
+}
+
 /// Top-level native `eframe` application hosting the ClickForge Desktop Workbench.
 pub struct ClickForgeWorkbenchApp {
+    pub(crate) active_tab: WorkbenchTab,
     pub(crate) scripts: Vec<ScriptDocument>,
     pub(crate) selected_script_id: Option<String>,
     pub(crate) dirty_script_ids: HashSet<String>,
@@ -110,6 +122,7 @@ impl ClickForgeWorkbenchApp {
         let initial_snapshot = bundle.coordinator.snapshot();
 
         Self {
+            active_tab: WorkbenchTab::Active,
             scripts: bundle.scripts,
             selected_script_id: initial_selected_id,
             dirty_script_ids: HashSet::new(),
@@ -188,12 +201,7 @@ impl ClickForgeWorkbenchApp {
                         });
                 }
                 TrayUiEvent::DisableAllScripts => {
-                    for script in &mut self.scripts {
-                        script.is_enabled = false;
-                    }
-                    let _ = self
-                        .coordinator
-                        .send_command(CoordinatorCommand::DisableAllScripts);
+                    self.disable_all_scripts();
                 }
                 TrayUiEvent::QuitApplication => {
                     self.should_allow_window_close = true;
@@ -412,55 +420,24 @@ impl ClickForgeWorkbenchApp {
             .filter(|result| result.script_id == script_id)
             .cloned()
     }
-}
 
-impl eframe::App for ClickForgeWorkbenchApp {
-    fn logic(&mut self, egui_context: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.did_apply_initial_visibility {
-            self.did_apply_initial_visibility = true;
-            if self.settings.start_minimized_to_tray && self.tray_handle.is_some() {
-                egui_context.send_viewport_cmd(ViewportCommand::Visible(false));
-                self.is_window_hidden_to_tray = true;
-            }
-        }
-
-        if self.shutdown_flag.load(Ordering::Relaxed) && !self.should_allow_window_close {
-            self.should_allow_window_close = true;
-            egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
-            egui_context.send_viewport_cmd(ViewportCommand::Close);
-        }
-
-        self.handle_tray_events(egui_context);
-        self.handle_close_request(egui_context);
-        self.latest_snapshot = self.coordinator.snapshot();
-        self.schedule_repaint_pacing(egui_context);
-    }
-
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let egui_context = ui.ctx().clone();
-        self.process_active_key_capture(&egui_context);
-        self.process_keyboard_shortcuts(&egui_context);
-
-        let mut sidebar_actions = Vec::new();
-        Panel::left("scripts_sidebar_panel")
-            .resizable(true)
-            .default_size(SIDEBAR_DEFAULT_WIDTH_PX)
-            .min_size(SIDEBAR_MIN_WIDTH_PX)
-            .max_size(SIDEBAR_MAX_WIDTH_PX)
-            .frame(build_panel_frame(SURFACE_PANEL, 10, 10))
+    fn render_active_workspace(&mut self, ui: &mut Ui) {
+        let mut dashboard_actions = Vec::new();
+        CentralPanel::default()
+            .frame(build_panel_frame(BG_CANVAS, 12, 10))
             .show(ui, |ui| {
-                let sidebar_view = SidebarViewModel {
+                let dashboard_view = ActiveDashboardViewModel {
                     scripts: &self.scripts,
                     selected_script_id: self.selected_script_id.as_deref(),
                     dirty_script_ids: &self.dirty_script_ids,
                     snapshot: &self.latest_snapshot,
-                    settings: &self.settings,
-                    has_system_tray: self.tray_handle.is_some(),
                 };
-                render_sidebar(ui, &sidebar_view, &mut sidebar_actions);
+                render_active_dashboard(ui, &dashboard_view, &mut dashboard_actions);
             });
-        self.apply_sidebar_actions(sidebar_actions);
+        self.apply_active_dashboard_actions(dashboard_actions);
+    }
 
+    fn render_editor_workspace(&mut self, ui: &mut Ui, egui_context: &egui::Context) {
         let mut settings_bar_actions = Vec::new();
         let active_index = self.active_script_index();
         let is_active_dirty = self
@@ -483,27 +460,6 @@ impl eframe::App for ClickForgeWorkbenchApp {
                 );
             });
         self.apply_settings_bar_actions(settings_bar_actions);
-
-        let active_index_for_drawer = self.active_script_index();
-        let mut did_toggle_drawer = false;
-        let drawer_response = Panel::bottom("telemetry_bottom_drawer")
-            .resizable(false)
-            .frame(build_panel_frame(SURFACE_PANEL, 12, 6))
-            .show(ui, |ui| {
-                let active_script_ref = active_index_for_drawer.map(|index| &self.scripts[index]);
-                did_toggle_drawer = render_telemetry_drawer(
-                    ui,
-                    &mut self.settings.show_telemetry_drawer,
-                    self.settings.telemetry_drawer_height_px,
-                    active_script_ref,
-                    &self.latest_snapshot,
-                    &mut self.histogram_cache,
-                );
-            });
-        let rendered_drawer_height_px = drawer_response.response.rect.height();
-        if did_toggle_drawer {
-            self.persist_settings_quietly();
-        }
 
         let active_index_after_chrome = self.active_script_index();
         let active_mode = active_index_after_chrome.map(|index| self.scripts[index].mode);
@@ -593,6 +549,91 @@ impl eframe::App for ClickForgeWorkbenchApp {
 
         self.apply_canvas_actions(canvas_actions);
         self.apply_rust_editor_actions(rust_editor_actions);
+    }
+}
+
+impl eframe::App for ClickForgeWorkbenchApp {
+    fn logic(&mut self, egui_context: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.did_apply_initial_visibility {
+            self.did_apply_initial_visibility = true;
+            if self.settings.start_minimized_to_tray && self.tray_handle.is_some() {
+                egui_context.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.is_window_hidden_to_tray = true;
+            }
+        }
+
+        if self.shutdown_flag.load(Ordering::Relaxed) && !self.should_allow_window_close {
+            self.should_allow_window_close = true;
+            egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
+            egui_context.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        self.handle_tray_events(egui_context);
+        self.handle_close_request(egui_context);
+        self.latest_snapshot = self.coordinator.snapshot();
+        self.schedule_repaint_pacing(egui_context);
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let egui_context = ui.ctx().clone();
+        self.process_active_key_capture(&egui_context);
+        self.process_keyboard_shortcuts(&egui_context);
+
+        let mut sidebar_actions = Vec::new();
+        Panel::left("scripts_sidebar_panel")
+            .resizable(true)
+            .default_size(SIDEBAR_DEFAULT_WIDTH_PX)
+            .min_size(SIDEBAR_MIN_WIDTH_PX)
+            .max_size(SIDEBAR_MAX_WIDTH_PX)
+            .frame(build_panel_frame(SURFACE_PANEL, 10, 10))
+            .show(ui, |ui| {
+                let sidebar_view = SidebarViewModel {
+                    active_tab: self.active_tab,
+                    scripts: &self.scripts,
+                    selected_script_id: self.selected_script_id.as_deref(),
+                    dirty_script_ids: &self.dirty_script_ids,
+                    snapshot: &self.latest_snapshot,
+                    settings: &self.settings,
+                    has_system_tray: self.tray_handle.is_some(),
+                };
+                render_sidebar(ui, &sidebar_view, &mut sidebar_actions);
+            });
+        self.apply_sidebar_actions(sidebar_actions);
+
+        if !self.latest_snapshot.input_status.is_uinput_ready {
+            Panel::top("uinput_offline_banner_panel")
+                .resizable(false)
+                .frame(build_panel_frame(SURFACE_PANEL, 14, 8))
+                .show(ui, |ui| {
+                    render_uinput_offline_banner(ui, &self.latest_snapshot.input_status);
+                });
+        }
+
+        let active_index_for_drawer = self.active_script_index();
+        let mut did_toggle_drawer = false;
+        let drawer_response = Panel::bottom("telemetry_bottom_drawer")
+            .resizable(false)
+            .frame(build_panel_frame(SURFACE_PANEL, 12, 6))
+            .show(ui, |ui| {
+                let active_script_ref = active_index_for_drawer.map(|index| &self.scripts[index]);
+                did_toggle_drawer = render_telemetry_drawer(
+                    ui,
+                    &mut self.settings.show_telemetry_drawer,
+                    self.settings.telemetry_drawer_height_px,
+                    active_script_ref,
+                    &self.latest_snapshot,
+                    &mut self.histogram_cache,
+                );
+            });
+        let rendered_drawer_height_px = drawer_response.response.rect.height();
+        if did_toggle_drawer {
+            self.persist_settings_quietly();
+        }
+
+        match self.active_tab {
+            WorkbenchTab::Active => self.render_active_workspace(ui),
+            WorkbenchTab::Editor => self.render_editor_workspace(ui, &egui_context),
+        }
 
         let mut picker_actions = Vec::new();
         let (open_windows, running_processes) = if self.target_picker_state.is_open {

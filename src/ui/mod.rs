@@ -1,3 +1,4 @@
+pub mod active_dashboard;
 pub mod app;
 mod app_actions;
 pub mod block_canvas;
@@ -11,5 +12,5 @@ pub mod target_picker_modal;
 pub mod telemetry_drawer;
 pub mod theme;
 
-pub use app::{ClickForgeWorkbenchApp, WorkbenchLaunchBundle};
+pub use app::{ClickForgeWorkbenchApp, WorkbenchLaunchBundle, WorkbenchTab};
 pub use theme::apply_forge_slate_theme;

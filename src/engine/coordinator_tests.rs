@@ -1,15 +1,19 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clickforge_sdk::{InputTrigger, KeyCode, MouseButton};
 
 use super::*;
 use crate::models::{
     GameTargetRule, InputError, ScriptExecutionPhase, ScriptMode, StatementKind, TargetMatchMode,
-    TargetScope, TriggerBlock, TriggerInterceptSpec, VisualProgram,
+    TargetScope, TelemetryLevel, TriggerBlock, TriggerInterceptSpec, VisualProgram,
 };
+
+const CONDITION_WAIT_TIMEOUT_MS: u64 = 500;
+const CONDITION_POLL_INTERVAL_MS: u64 = 5;
+const MULTI_TICK_STABILITY_WINDOW_MS: u64 = 75;
 
 #[derive(Default)]
 struct RecordingSink {
@@ -276,6 +280,199 @@ fn coordinator_toggles_script_armed_state_via_arm_toggle_key() {
     assert!(intercept.is_intercept_active());
 
     handle.shutdown();
+}
+
+struct FailingTriggerIntercept {
+    should_fail: AtomicBool,
+    is_active: AtomicBool,
+    enable_attempt_count: AtomicU64,
+    last_attempted_spec: Mutex<Option<TriggerInterceptSpec>>,
+}
+
+impl FailingTriggerIntercept {
+    fn new_failing() -> Self {
+        Self {
+            should_fail: AtomicBool::new(true),
+            is_active: AtomicBool::new(false),
+            enable_attempt_count: AtomicU64::new(0),
+            last_attempted_spec: Mutex::new(None),
+        }
+    }
+
+    fn set_should_fail(&self, should_fail: bool) {
+        self.should_fail.store(should_fail, Ordering::SeqCst);
+    }
+
+    fn enable_attempts(&self) -> u64 {
+        self.enable_attempt_count.load(Ordering::SeqCst)
+    }
+
+    fn last_attempted(&self) -> Option<TriggerInterceptSpec> {
+        self.last_attempted_spec
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+    }
+}
+
+impl TriggerInterceptControl for FailingTriggerIntercept {
+    fn set_intercept(
+        &self,
+        intercept_spec: Option<TriggerInterceptSpec>,
+    ) -> Result<(), InputError> {
+        if intercept_spec.is_some() {
+            self.enable_attempt_count.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut guard) = self.last_attempted_spec.lock() {
+                *guard = intercept_spec;
+            }
+            if self.should_fail.load(Ordering::SeqCst) {
+                self.is_active.store(false, Ordering::SeqCst);
+                return Err(InputError::DeviceUnavailable {
+                    detail: "Cannot enable trigger interception while /dev/uinput is unavailable."
+                        .to_string(),
+                });
+            }
+        }
+        self.is_active
+            .store(intercept_spec.is_some(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn is_intercept_active(&self) -> bool {
+        self.is_active.load(Ordering::SeqCst)
+    }
+}
+
+fn count_intercept_failure_warnings(snapshot: &CoordinatorSnapshot) -> usize {
+    snapshot
+        .telemetry_logs
+        .iter()
+        .filter(|entry| {
+            entry.level == TelemetryLevel::Warning
+                && entry.message.contains("Trigger intercept update failed")
+        })
+        .count()
+}
+
+fn wait_until_condition(mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(CONDITION_WAIT_TIMEOUT_MS);
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(CONDITION_POLL_INTERVAL_MS));
+    }
+    predicate()
+}
+
+#[test]
+fn failed_trigger_intercept_logs_warning_once_without_tick_spam() -> Result<(), String> {
+    let mut game_script = build_focus_gated_game_script();
+    let (focus_sender, focus_receiver) = mpsc::sync_channel(16);
+    let shared_window = Arc::new(Mutex::new(None::<ActiveWindowSnapshot>));
+    let provider_window = Arc::clone(&shared_window);
+    let failing_intercept = Arc::new(FailingTriggerIntercept::new_failing());
+
+    let handle = start_coordinator(CoordinatorStartConfig {
+        initial_scripts: vec![game_script.clone()],
+        input_sink: Arc::new(RecordingSink::default()),
+        physical_input: Arc::new(TestPhysicalInput::default()),
+        trigger_intercept: Arc::clone(&failing_intercept) as Arc<dyn TriggerInterceptControl>,
+        input_status: InputSubsystemStatus::default(),
+        window_snapshot_provider: Arc::new(move || {
+            let current = provider_window.lock().ok().and_then(|guard| guard.clone());
+            (current, Vec::new(), Vec::new())
+        }),
+        input_event_receiver: None,
+        focus_event_receiver: Some(focus_receiver),
+        on_tray_state_changed: None,
+        on_ui_repaint_needed: None,
+        shutdown_flag: Arc::new(AtomicBool::new(false)),
+        script_build_cache_dir: None,
+    });
+
+    let focused_game = ActiveWindowSnapshot {
+        window_id: Some(1),
+        title: "Here Comes the Horde".to_string(),
+        app_id: "steam_app_2560650".to_string(),
+        pid: Some(1200),
+        is_focused: true,
+        compositor_name: "niri".to_string(),
+    };
+    if let Ok(mut guard) = shared_window.lock() {
+        *guard = Some(focused_game.clone());
+    }
+    let _ = focus_sender.send(focused_game.clone());
+
+    assert!(wait_until_condition(|| {
+        failing_intercept.enable_attempts() >= 1
+            && count_intercept_failure_warnings(&handle.snapshot()) >= 1
+    }));
+    thread::sleep(Duration::from_millis(MULTI_TICK_STABILITY_WINDOW_MS));
+    assert_eq!(failing_intercept.enable_attempts(), 1);
+    assert_eq!(count_intercept_failure_warnings(&handle.snapshot()), 1);
+    assert!(!failing_intercept.is_intercept_active());
+
+    let unfocused_browser = ActiveWindowSnapshot {
+        window_id: Some(2),
+        title: "Browser".to_string(),
+        app_id: "firefox".to_string(),
+        pid: Some(2200),
+        is_focused: true,
+        compositor_name: "niri".to_string(),
+    };
+    if let Ok(mut guard) = shared_window.lock() {
+        *guard = Some(unfocused_browser.clone());
+    }
+    let _ = focus_sender.send(unfocused_browser);
+    assert!(wait_until_condition(|| {
+        handle
+            .snapshot()
+            .status_for_script(&game_script.id)
+            .map(|status| status.phase)
+            == Some(ScriptExecutionPhase::WaitingForFocus)
+    }));
+
+    if let Ok(mut guard) = shared_window.lock() {
+        *guard = Some(focused_game.clone());
+    }
+    let _ = focus_sender.send(focused_game);
+    assert!(wait_until_condition(|| {
+        failing_intercept.enable_attempts() >= 2
+            && count_intercept_failure_warnings(&handle.snapshot()) >= 2
+    }));
+    thread::sleep(Duration::from_millis(MULTI_TICK_STABILITY_WINDOW_MS));
+    assert_eq!(failing_intercept.enable_attempts(), 2);
+    assert_eq!(count_intercept_failure_warnings(&handle.snapshot()), 2);
+
+    game_script.visual_program.trigger = TriggerBlock::WhileInputHeld {
+        trigger_input: InputTrigger::Mouse(MouseButton::Right),
+    };
+    handle.send_command(CoordinatorCommand::UpsertScript(game_script.clone()))?;
+    assert!(wait_until_condition(|| {
+        failing_intercept.enable_attempts() >= 3
+            && count_intercept_failure_warnings(&handle.snapshot()) >= 3
+    }));
+    thread::sleep(Duration::from_millis(MULTI_TICK_STABILITY_WINDOW_MS));
+    assert_eq!(failing_intercept.enable_attempts(), 3);
+    assert_eq!(count_intercept_failure_warnings(&handle.snapshot()), 3);
+    assert_eq!(
+        failing_intercept.last_attempted(),
+        Some(TriggerInterceptSpec {
+            trigger_input: InputTrigger::Mouse(MouseButton::Right),
+        })
+    );
+
+    failing_intercept.set_should_fail(false);
+    handle.send_command(CoordinatorCommand::SyncScripts(vec![game_script]))?;
+    assert!(wait_until_condition(
+        || failing_intercept.is_intercept_active()
+    ));
+    assert_eq!(failing_intercept.enable_attempts(), 4);
+    assert_eq!(count_intercept_failure_warnings(&handle.snapshot()), 3);
+
+    handle.shutdown();
+    Ok(())
 }
 
 #[test]
