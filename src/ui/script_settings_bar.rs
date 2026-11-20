@@ -6,8 +6,8 @@ use egui::{
 };
 
 use crate::models::{
-    CoordinatorSnapshot, ScriptDocument, ScriptMode, TargetScope, ValidationReport,
-    inspect_script_validation,
+    CoordinatorSnapshot, CustomBlockDefinition, ScriptDocument, ScriptMode, TargetScope,
+    ValidationReport, inspect_script_validation_with_custom_blocks,
 };
 use crate::ui::theme::{
     ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE,
@@ -68,6 +68,7 @@ pub enum SettingsBarAction {
 pub fn render_script_settings_bar(
     ui: &mut Ui,
     active_script: Option<&mut ScriptDocument>,
+    custom_blocks: &[CustomBlockDefinition],
     is_dirty: bool,
     active_key_capture: Option<KeyCaptureTarget>,
     snapshot: &CoordinatorSnapshot,
@@ -78,7 +79,7 @@ pub fn render_script_settings_bar(
         return;
     };
 
-    let validation_report = inspect_script_validation(script);
+    let validation_report = inspect_script_validation_with_custom_blocks(script, custom_blocks);
     let is_valid = validation_report.is_valid();
 
     let row_width_px = ui.available_width();

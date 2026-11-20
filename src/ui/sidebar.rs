@@ -9,8 +9,8 @@ use egui::{
 };
 
 use crate::models::{
-    CoordinatorSnapshot, ScriptDocument, ScriptExecutionPhase, TargetScope,
-    inspect_script_validation,
+    CoordinatorSnapshot, CustomBlockDefinition, ScriptDocument, ScriptExecutionPhase, TargetScope,
+    inspect_script_validation_with_custom_blocks,
 };
 use crate::storage::AppSettings;
 use crate::ui::app::WorkbenchTab;
@@ -99,6 +99,7 @@ pub enum SidebarAction {
 pub struct SidebarViewModel<'frame> {
     pub active_tab: WorkbenchTab,
     pub scripts: &'frame [ScriptDocument],
+    pub custom_blocks: &'frame [CustomBlockDefinition],
     pub selected_script_id: Option<&'frame str>,
     pub dirty_script_ids: &'frame HashSet<String>,
     pub snapshot: &'frame CoordinatorSnapshot,
@@ -533,7 +534,8 @@ fn render_script_row(
 ) {
     let is_selected = view_model.selected_script_id == Some(script.id.as_str());
     let is_dirty = view_model.dirty_script_ids.contains(&script.id);
-    let validation_report = inspect_script_validation(script);
+    let validation_report =
+        inspect_script_validation_with_custom_blocks(script, view_model.custom_blocks);
     let is_valid = validation_report.is_valid();
     let runtime_status = view_model.snapshot.status_for_script(&script.id);
     let runtime_phase = runtime_status
@@ -768,21 +770,18 @@ fn render_row_icon_button(
     let center = rect.center();
     let stroke = Stroke::new(1.2, icon_color);
     if is_delete_icon {
-        painter.line_segment(
-            [
-                pos2(center.x - 5.0, center.y - 3.5),
-                pos2(center.x + 5.0, center.y - 3.5),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                pos2(center.x - 2.0, center.y - 5.2),
-                pos2(center.x + 2.0, center.y - 5.2),
-            ],
-            stroke,
-        );
-        let body = Rect::from_center_size(pos2(center.x, center.y + 1.0), vec2(7.6, 8.0));
+        let (center_x_px, center_y_px) = (center.x, center.y);
+        let lid_segment = [
+            pos2(center_x_px - 5.0, center_y_px - 3.5),
+            pos2(center_x_px + 5.0, center_y_px - 3.5),
+        ];
+        let handle_segment = [
+            pos2(center_x_px - 2.0, center_y_px - 5.2),
+            pos2(center_x_px + 2.0, center_y_px - 5.2),
+        ];
+        painter.line_segment(lid_segment, stroke);
+        painter.line_segment(handle_segment, stroke);
+        let body = Rect::from_center_size(pos2(center_x_px, center_y_px + 1.0), vec2(7.6, 8.0));
         painter.rect_stroke(body, CornerRadius::same(1), stroke, StrokeKind::Inside);
     } else {
         let back = Rect::from_center_size(pos2(center.x - 1.5, center.y - 1.5), vec2(7.0, 7.0));

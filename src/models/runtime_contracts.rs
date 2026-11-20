@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::models::blocks::BlockId;
+use crate::models::custom_blocks::CustomBlockDefinition;
 use crate::models::script::ScriptDocument;
 use crate::models::target::{ActiveWindowSnapshot, RunningProcessEntry};
 
@@ -278,6 +279,7 @@ impl CoordinatorSnapshot {
 #[derive(Debug, Clone)]
 pub enum CoordinatorCommand {
     SyncScripts(Vec<ScriptDocument>),
+    SyncCustomBlocks(Vec<CustomBlockDefinition>),
     UpsertScript(ScriptDocument),
     RemoveScript { script_id: String },
     SetScriptEnabled { script_id: String, is_enabled: bool },

@@ -8,14 +8,16 @@ use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 
 use crate::engine::block_interpreter::{
-    BlockExecutionHooks, ProgramStopReason, execute_visual_program,
+    BlockExecutionHooks, ProgramStopReason, VisualExecutionRequest,
+    execute_visual_program_with_request,
 };
 use crate::engine::rust_script_runner::{
     RustExecutionHooks, compile_rust_script, run_compiled_rust_script,
 };
 use crate::models::{
-    ActiveWindowSnapshot, BlockId, CompileResultSnapshot, InputSink, PhysicalInputReader,
-    ScriptDocument, ScriptExecutionPhase, ScriptRuntimeStatus, TrayRuntimeState,
+    ActiveWindowSnapshot, BlockId, CompileResultSnapshot, CustomBlockDefinition, InputSink,
+    PhysicalInputReader, ScriptDocument, ScriptExecutionPhase, ScriptMode, ScriptRuntimeStatus,
+    TrayRuntimeState,
 };
 
 pub(crate) enum WorkerEvent {
@@ -159,6 +161,7 @@ impl ScriptWorkerSupervisor {
         &mut self,
         script: &ScriptDocument,
         revision_hash: u64,
+        custom_blocks: Arc<Vec<CustomBlockDefinition>>,
         input_sink: Arc<dyn InputSink>,
         physical_input: Arc<dyn PhysicalInputReader>,
     ) {
@@ -171,11 +174,14 @@ impl ScriptWorkerSupervisor {
 
         let join_handle = thread::spawn(move || {
             let mut hooks = build_visual_hooks(&event_sender, &script_id);
-            let outcome = execute_visual_program(
-                &visual_program,
-                input_sink,
-                physical_input,
-                &worker_abort,
+            let outcome = execute_visual_program_with_request(
+                VisualExecutionRequest {
+                    program: &visual_program,
+                    custom_blocks: custom_blocks.as_slice(),
+                    input_sink,
+                    physical_input,
+                    abort_flag: &worker_abort,
+                },
                 &mut hooks,
             );
             let (stopped_by_block, error_message) = match outcome {
@@ -419,12 +425,32 @@ pub(crate) fn build_tray_runtime_state(
     }
 }
 
-pub(crate) fn compute_script_revision_hash(script: &ScriptDocument) -> u64 {
+pub(crate) fn compute_custom_blocks_hash(custom_blocks: &[CustomBlockDefinition]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    custom_blocks.len().hash(&mut hasher);
+    if let Ok(serialized_tiles) = serde_json::to_vec(custom_blocks) {
+        serialized_tiles.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+pub(crate) fn compute_script_revision_hash(
+    script: &ScriptDocument,
+    custom_blocks_hash: u64,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     script.mode.hash(&mut hasher);
     script.rust_source.hash(&mut hasher);
     if let Ok(serialized_program) = serde_json::to_vec(&script.visual_program) {
         serialized_program.hash(&mut hasher);
+    }
+    if script.mode == ScriptMode::VisualBlocks
+        && !script
+            .visual_program
+            .referenced_custom_block_ids()
+            .is_empty()
+    {
+        custom_blocks_hash.hash(&mut hasher);
     }
     hasher.finish()
 }

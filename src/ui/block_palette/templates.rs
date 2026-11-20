@@ -4,7 +4,7 @@ use crate::models::{BlockCategory, ConditionExpr, StatementKind, TriggerBlock};
 use crate::ui::block_palette::{BlockDragPayload, PaletteAction};
 
 #[derive(Clone, Copy)]
-pub(super) enum PaletteTemplateId {
+pub(crate) enum PaletteTemplateId {
     WhileHeld,
     ToggleInput,
     OncePressed,
@@ -17,6 +17,7 @@ pub(super) enum PaletteTemplateId {
     StopScript,
     DoNothing,
     MouseClick,
+    MouseHoldWhilePressed,
     MouseDown,
     MouseUp,
     MouseMove,
@@ -32,7 +33,7 @@ pub(super) enum PaletteTemplateId {
     ChangeVariable,
 }
 
-pub(super) struct PaletteTemplateSpec {
+pub(crate) struct PaletteTemplateSpec {
     pub id: PaletteTemplateId,
     pub title: &'static str,
     pub summary: &'static str,
@@ -56,7 +57,7 @@ const fn define_template(
     }
 }
 
-pub(super) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 25] = [
+pub(crate) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 26] = [
     define_template(
         PaletteTemplateId::WhileHeld,
         "While Input Held",
@@ -138,6 +139,13 @@ pub(super) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 25] = [
         PaletteTemplateId::MouseClick,
         "Mouse Click",
         "Presses and releases a mouse button with hold duration",
+        BlockCategory::Action,
+        false,
+    ),
+    define_template(
+        PaletteTemplateId::MouseHoldWhilePressed,
+        "Mouse Hold / Drag",
+        "Hold mouse button while physical input stays pressed (supports real clicks and dragging)",
         BlockCategory::Action,
         false,
     ),
@@ -282,7 +290,7 @@ pub(super) fn build_template_action_and_payload(
     }
 }
 
-fn build_default_statement_kind(template_id: PaletteTemplateId) -> StatementKind {
+pub(crate) fn build_default_statement_kind(template_id: PaletteTemplateId) -> StatementKind {
     let default_left_click = ConditionExpr::IsInputPressed {
         input: InputTrigger::Mouse(MouseButton::Left),
     };
@@ -312,6 +320,10 @@ fn build_default_statement_kind(template_id: PaletteTemplateId) -> StatementKind
         PaletteTemplateId::MouseClick => StatementKind::MouseClick {
             mouse_button: MouseButton::Left,
             hold_duration_ms: 12,
+        },
+        PaletteTemplateId::MouseHoldWhilePressed => StatementKind::MouseHoldWhilePressed {
+            button: MouseButton::Left,
+            watch_input: InputTrigger::Mouse(MouseButton::Left),
         },
         PaletteTemplateId::MouseDown => StatementKind::MouseDown {
             mouse_button: MouseButton::Left,

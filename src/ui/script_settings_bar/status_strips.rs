@@ -180,6 +180,7 @@ pub(crate) fn has_kill_switch_collision(validation_report: &ValidationReport) ->
         || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithArmToggleKey)
         || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithEmittedKey)
         || validation_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithConditionKey)
+        || validation_report.has_issue(ValidationIssueCode::KillSwitchCollision)
 }
 
 fn build_concise_validation_summary(validation_report: &ValidationReport) -> String {

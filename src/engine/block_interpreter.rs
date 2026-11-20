@@ -3,16 +3,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use clickforge_sdk::InputTrigger;
+use clickforge_sdk::{InputTrigger, MouseButton};
 use rand::RngExt;
 
 use crate::engine::timing::{
-    perform_key_tap_on_sink, perform_mouse_click_on_sink, perform_type_text_on_sink,
-    sample_clamped_gaussian_delay_ms, sample_uniform_delay_ms, wait_interruptible_ms,
+    INTERRUPT_POLL_SLICE_MS, perform_key_tap_on_sink, perform_mouse_click_on_sink,
+    perform_type_text_on_sink, sample_clamped_gaussian_delay_ms, sample_uniform_delay_ms,
+    wait_interruptible_ms,
 };
 use crate::models::{
-    BlockId, ConditionExpr, InputSink, PhysicalInputReader, StatementBlock, StatementKind,
-    TriggerBlock, VisualProgram,
+    BlockId, ConditionExpr, CustomBlockDefinition, InputSink, MAX_CUSTOM_BLOCK_CALL_DEPTH,
+    PhysicalInputReader, StatementBlock, StatementKind, TriggerBlock, VisualProgram,
+    lookup_custom_block,
 };
 
 /// Maximum distinct local script variables permitted per Visual Block execution.
@@ -52,6 +54,15 @@ impl BlockExecutionHooks {
     }
 }
 
+/// Execution request bundle for interpreting a Visual Block program with custom tiles.
+pub struct VisualExecutionRequest<'run> {
+    pub program: &'run VisualProgram,
+    pub custom_blocks: &'run [CustomBlockDefinition],
+    pub input_sink: Arc<dyn InputSink>,
+    pub physical_input: Arc<dyn PhysicalInputReader>,
+    pub abort_flag: &'run AtomicBool,
+}
+
 /// Terminal reason explaining why a Visual Block interpreter invocation exited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramStopReason {
@@ -78,17 +89,20 @@ impl Drop for InputReleaseGuard {
 }
 
 struct InterpreterState<'run> {
+    custom_blocks: &'run [CustomBlockDefinition],
     input_sink: Arc<dyn InputSink>,
     physical_input: Arc<dyn PhysicalInputReader>,
     abort_flag: &'run AtomicBool,
     hooks: &'run mut BlockExecutionHooks,
     variables: HashMap<String, f64>,
     last_active_block_id: Option<BlockId>,
+    custom_call_depth: usize,
+    active_custom_block_stack: Vec<&'run str>,
 }
 
 impl<'run> InterpreterState<'run> {
     fn is_aborted(&self) -> bool {
-        self.abort_flag.load(Ordering::SeqCst)
+        self.abort_flag.load(Ordering::Acquire)
     }
 
     fn set_active_block(&mut self, block_id: Option<BlockId>) {
@@ -107,7 +121,9 @@ impl<'run> InterpreterState<'run> {
             if self.is_aborted() {
                 return Ok(BlockControlFlow::Aborted);
             }
-            self.set_active_block(Some(block.id));
+            if self.custom_call_depth == 0 {
+                self.set_active_block(Some(block.id));
+            }
             let flow_signal = self.execute_single_block(block)?;
             if flow_signal != BlockControlFlow::Continue {
                 return Ok(flow_signal);
@@ -138,6 +154,10 @@ impl<'run> InterpreterState<'run> {
             StatementKind::BreakLoop => Ok(BlockControlFlow::BreakLoop),
             StatementKind::StopScript => Ok(BlockControlFlow::StopScript),
             StatementKind::DoNothing => Ok(BlockControlFlow::Continue),
+            StatementKind::MouseHoldWhilePressed {
+                button,
+                watch_input,
+            } => self.execute_mouse_hold_while_pressed(*button, *watch_input),
             StatementKind::MouseClick { .. }
             | StatementKind::MouseDown { .. }
             | StatementKind::MouseUp { .. }
@@ -158,6 +178,10 @@ impl<'run> InterpreterState<'run> {
                 variable_name,
                 delta_value,
             } => self.execute_change_variable(variable_name, *delta_value),
+            StatementKind::RunCustomBlock {
+                custom_block_id,
+                cached_name,
+            } => self.execute_run_custom_block(custom_block_id, cached_name),
         }
     }
 
@@ -226,6 +250,73 @@ impl<'run> InterpreterState<'run> {
             }
         }
         Ok(BlockControlFlow::Continue)
+    }
+
+    fn execute_mouse_hold_while_pressed(
+        &mut self,
+        mouse_button: MouseButton,
+        watch_input: InputTrigger,
+    ) -> Result<BlockControlFlow, String> {
+        if self.is_aborted() {
+            return Ok(BlockControlFlow::Aborted);
+        }
+        if !is_input_currently_pressed(self.physical_input.as_ref(), watch_input) {
+            return Ok(BlockControlFlow::Continue);
+        }
+        self.input_sink
+            .mouse_down(mouse_button)
+            .map_err(|input_error| input_error.to_string())?;
+        self.hooks.report_action_executed();
+
+        while !self.abort_flag.load(Ordering::Acquire)
+            && is_input_currently_pressed(self.physical_input.as_ref(), watch_input)
+        {
+            std::thread::sleep(Duration::from_millis(INTERRUPT_POLL_SLICE_MS));
+        }
+
+        let release_result = self
+            .input_sink
+            .mouse_up(mouse_button)
+            .map_err(|input_error| input_error.to_string());
+        release_result?;
+
+        if self.is_aborted() {
+            return Ok(BlockControlFlow::Aborted);
+        }
+        Ok(BlockControlFlow::Continue)
+    }
+
+    fn execute_run_custom_block(
+        &mut self,
+        custom_block_id: &str,
+        cached_name: &str,
+    ) -> Result<BlockControlFlow, String> {
+        if self.custom_call_depth >= MAX_CUSTOM_BLOCK_CALL_DEPTH {
+            return Err(format!(
+                "Custom tile call depth exceeded limit of {MAX_CUSTOM_BLOCK_CALL_DEPTH} while running '{cached_name}' ({custom_block_id})."
+            ));
+        }
+        let Some(definition) = lookup_custom_block(self.custom_blocks, custom_block_id) else {
+            return Err(format!(
+                "Custom tile '{cached_name}' ({custom_block_id}) was not found."
+            ));
+        };
+        if self
+            .active_custom_block_stack
+            .contains(&definition.id.as_str())
+        {
+            return Err(format!(
+                "Cyclic custom tile recursion detected for '{}' ({custom_block_id}).",
+                definition.name
+            ));
+        }
+
+        self.custom_call_depth = self.custom_call_depth.saturating_add(1);
+        self.active_custom_block_stack.push(definition.id.as_str());
+        let execution_result = self.run_statement_slice(&definition.statements);
+        self.active_custom_block_stack.pop();
+        self.custom_call_depth = self.custom_call_depth.saturating_sub(1);
+        execution_result
     }
 
     fn execute_input_action(&mut self, kind: &StatementKind) -> Result<BlockControlFlow, String> {
@@ -468,16 +559,43 @@ pub fn execute_visual_program(
     abort_flag: &AtomicBool,
     hooks: &mut BlockExecutionHooks,
 ) -> Result<ProgramStopReason, String> {
+    execute_visual_program_with_request(
+        VisualExecutionRequest {
+            program,
+            custom_blocks: &[],
+            input_sink,
+            physical_input,
+            abort_flag,
+        },
+        hooks,
+    )
+}
+
+/// Executes a Visual Block AST program using a `VisualExecutionRequest` with custom tiles.
+pub fn execute_visual_program_with_request(
+    request: VisualExecutionRequest<'_>,
+    hooks: &mut BlockExecutionHooks,
+) -> Result<ProgramStopReason, String> {
+    let VisualExecutionRequest {
+        program,
+        custom_blocks,
+        input_sink,
+        physical_input,
+        abort_flag,
+    } = request;
     let _release_guard = InputReleaseGuard {
         input_sink: Arc::clone(&input_sink),
     };
     let mut state = InterpreterState {
+        custom_blocks,
         input_sink,
         physical_input,
         abort_flag,
         hooks,
         variables: HashMap::new(),
         last_active_block_id: None,
+        custom_call_depth: 0,
+        active_custom_block_stack: Vec::with_capacity(MAX_CUSTOM_BLOCK_CALL_DEPTH),
     };
 
     let outcome = match &program.trigger {
@@ -512,6 +630,13 @@ pub fn execute_visual_program(
     };
     state.set_active_block(None);
     outcome
+}
+
+fn is_input_currently_pressed(
+    physical_input: &dyn PhysicalInputReader,
+    watch_input: InputTrigger,
+) -> bool {
+    physical_input.is_trigger_pressed(watch_input)
 }
 
 fn are_all_inputs_pressed(

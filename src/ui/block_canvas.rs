@@ -1,3 +1,4 @@
+mod tree_mutations;
 mod trigger_hat;
 
 use egui::{
@@ -6,8 +7,8 @@ use egui::{
 };
 
 use crate::models::{
-    BlockCategory, BlockId, BlockSlotTarget, ScriptDocument, StatementBlock, StatementKind,
-    ValidationReport, VisualProgram,
+    BlockCategory, BlockId, BlockSlotTarget, CustomBlockDefinition, ScriptDocument, StatementBlock,
+    StatementKind, ValidationReport, lookup_custom_block,
 };
 use crate::ui::block_node_renderer::{
     BlockRenderContext, BlockRenderMutation, FULL_BLOCK_GEOMETRY, build_leaf_block_shapes,
@@ -18,9 +19,12 @@ use crate::ui::theme::{
     ACCENT_PRIMARY, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE, CORNER_RADIUS_SM_PX,
     FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX, STATUS_DANGER_INK, STATUS_DANGER_SOLID,
     STATUS_DANGER_TINT, SURFACE_ELEVATED, SURFACE_PANEL, TEXT_MUTED, TEXT_PRIMARY,
-    block_visual_colors, rich_mono, rich_semibold,
+    block_visual_colors, custom_block_visual_colors, rich_mono, rich_semibold,
 };
 
+use tree_mutations::{
+    clone_block_slice_with_fresh_ids, clone_block_with_fresh_ids, replace_block_with_slice_in_tree,
+};
 use trigger_hat::render_trigger_hat_block;
 
 const GRID_SPACING_PX: f32 = 22.0;
@@ -37,11 +41,20 @@ const CANVAS_SCROLL_PADDING_PX: f32 = 14.0;
 const CANVAS_BOTTOM_BREATHING_PX: f32 = 64.0;
 const MAX_GHOST_SUMMARY_CHARS: usize = 36;
 
-/// High-level actions emitted by the visual block canvas toolbar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// High-level actions emitted by the visual block canvas toolbar and context menu.
+#[derive(Debug, Clone)]
 pub enum BlockCanvasAction {
     MarkDirty,
     ExportToRust,
+    EditCustomBlock(String),
+    UnpackCustomBlock {
+        tile_name: String,
+        unpacked_block_count: usize,
+    },
+    SaveBlockAsCustomTile {
+        suggested_name: String,
+        statements: Vec<StatementBlock>,
+    },
 }
 
 /// Renders the Scratch-style visual block workspace, trigger hat, and drag-and-drop canvas.
@@ -50,6 +63,7 @@ pub fn render_block_canvas(
     script: &mut ScriptDocument,
     active_block_id: Option<BlockId>,
     validation_report: &ValidationReport,
+    custom_blocks: &[CustomBlockDefinition],
     drag_state: &mut BlockDragState,
     emitted_actions: &mut Vec<BlockCanvasAction>,
 ) {
@@ -88,6 +102,7 @@ pub fn render_block_canvas(
                     let render_context = BlockRenderContext {
                         active_block_id,
                         validation_report,
+                        custom_blocks,
                         pointer_pos,
                     };
                     render_statement_stack(
@@ -110,7 +125,7 @@ pub fn render_block_canvas(
         emitted_actions.push(BlockCanvasAction::MarkDirty);
     }
 
-    if apply_render_mutations(script, render_mutations) {
+    if apply_render_mutations(script, custom_blocks, render_mutations, emitted_actions) {
         emitted_actions.push(BlockCanvasAction::MarkDirty);
     }
 
@@ -192,6 +207,7 @@ fn render_canvas_toolbar(
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     let export_button = Button::new(rich_semibold(
                         "Export to Rust",
                         FONT_SIZE_SMALL_PX,
@@ -210,6 +226,36 @@ fn render_canvas_toolbar(
                     {
                         emitted_actions.push(BlockCanvasAction::ExportToRust);
                     }
+
+                    let has_statements = !script.visual_program.statements.is_empty();
+                    let save_tile_button = Button::new(rich_semibold(
+                        "Save Stack as Tile",
+                        FONT_SIZE_SMALL_PX,
+                        if has_statements {
+                            TEXT_PRIMARY
+                        } else {
+                            TEXT_MUTED
+                        },
+                    ))
+                    .fill(SURFACE_ELEVATED)
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX));
+
+                    let save_tile_response = ui.add_enabled(has_statements, save_tile_button);
+                    if save_tile_response.clicked() {
+                        emitted_actions.push(BlockCanvasAction::SaveBlockAsCustomTile {
+                            suggested_name: script.name.clone(),
+                            statements: script.visual_program.statements.clone(),
+                        });
+                    }
+                    if has_statements {
+                        save_tile_response.on_hover_text(
+                            "Save this script's statement stack as a reusable Custom Tile in My Blocks",
+                        );
+                    } else {
+                        save_tile_response
+                            .on_disabled_hover_text("Add at least one block before saving as a tile");
+                    }
                 });
             });
         });
@@ -217,7 +263,9 @@ fn render_canvas_toolbar(
 
 fn apply_render_mutations(
     script: &mut ScriptDocument,
+    custom_blocks: &[CustomBlockDefinition],
     mutations: Vec<BlockRenderMutation>,
+    emitted_actions: &mut Vec<BlockCanvasAction>,
 ) -> bool {
     let mut did_modify = false;
     for mutation in mutations {
@@ -245,59 +293,53 @@ fn apply_render_mutations(
             BlockRenderMutation::DeleteBlock(block_id) => {
                 did_modify |= script.visual_program.remove_block(block_id).is_some();
             }
+            BlockRenderMutation::SaveBlockAsCustomTile(block_id) => {
+                let Some(source_clone) = script.visual_program.find_block(block_id).cloned() else {
+                    continue;
+                };
+                let suggested_name = match &source_clone.kind {
+                    StatementKind::RunCustomBlock { cached_name, .. }
+                        if !cached_name.trim().is_empty() =>
+                    {
+                        format!("{} Copy", cached_name.trim())
+                    }
+                    other_kind => other_kind.title().to_string(),
+                };
+                emitted_actions.push(BlockCanvasAction::SaveBlockAsCustomTile {
+                    suggested_name,
+                    statements: vec![source_clone],
+                });
+            }
+            BlockRenderMutation::EditCustomBlock(custom_block_id) => {
+                emitted_actions.push(BlockCanvasAction::EditCustomBlock(custom_block_id));
+            }
+            BlockRenderMutation::UnpackCustomBlock {
+                block_id,
+                custom_block_id,
+            } => {
+                let Some(definition) = lookup_custom_block(custom_blocks, &custom_block_id) else {
+                    continue;
+                };
+                let unpacked_blocks = clone_block_slice_with_fresh_ids(
+                    &mut script.visual_program,
+                    &definition.statements,
+                );
+                let unpacked_block_count = definition.total_block_count();
+                if replace_block_with_slice_in_tree(
+                    &mut script.visual_program.statements,
+                    block_id,
+                    unpacked_blocks,
+                ) {
+                    did_modify = true;
+                    emitted_actions.push(BlockCanvasAction::UnpackCustomBlock {
+                        tile_name: definition.name.clone(),
+                        unpacked_block_count,
+                    });
+                }
+            }
         }
     }
     did_modify
-}
-
-fn clone_block_with_fresh_ids(
-    program: &mut VisualProgram,
-    source_block: &StatementBlock,
-) -> StatementBlock {
-    let cloned_kind = match &source_block.kind {
-        StatementKind::IfThen {
-            condition,
-            then_blocks,
-        } => StatementKind::IfThen {
-            condition: condition.clone(),
-            then_blocks: clone_block_slice_with_fresh_ids(program, then_blocks),
-        },
-        StatementKind::IfThenElse {
-            condition,
-            then_blocks,
-            else_blocks,
-        } => StatementKind::IfThenElse {
-            condition: condition.clone(),
-            then_blocks: clone_block_slice_with_fresh_ids(program, then_blocks),
-            else_blocks: clone_block_slice_with_fresh_ids(program, else_blocks),
-        },
-        StatementKind::WhileCondition {
-            condition,
-            body_blocks,
-        } => StatementKind::WhileCondition {
-            condition: condition.clone(),
-            body_blocks: clone_block_slice_with_fresh_ids(program, body_blocks),
-        },
-        StatementKind::RepeatCount {
-            repeat_count,
-            body_blocks,
-        } => StatementKind::RepeatCount {
-            repeat_count: *repeat_count,
-            body_blocks: clone_block_slice_with_fresh_ids(program, body_blocks),
-        },
-        leaf_kind => leaf_kind.clone(),
-    };
-    program.create_block(cloned_kind)
-}
-
-fn clone_block_slice_with_fresh_ids(
-    program: &mut VisualProgram,
-    source_blocks: &[StatementBlock],
-) -> Vec<StatementBlock> {
-    source_blocks
-        .iter()
-        .map(|block| clone_block_with_fresh_ids(program, block))
-        .collect()
 }
 
 fn finalize_active_drag(
@@ -433,7 +475,10 @@ fn paint_drag_ghost_preview(ui: &Ui, pointer_pos: Option<Pos2>, drag_state: &Blo
     };
 
     let is_deleting = drag_state.is_hovering_trash_zone && drag_state.is_dragging_existing_block();
-    let visual_colors = block_visual_colors(active_drag.category);
+    let visual_colors = active_drag
+        .custom_color
+        .map(custom_block_visual_colors)
+        .unwrap_or_else(|| block_visual_colors(active_drag.category));
     let summary_text = truncate_summary(&active_drag.preview_summary, MAX_GHOST_SUMMARY_CHARS);
 
     Area::new(Id::unique("block_drag_ghost_area"))

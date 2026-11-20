@@ -15,6 +15,21 @@ pub enum BlockCategory {
     Action,
     Timing,
     Variable,
+    Custom,
+}
+
+impl BlockCategory {
+    /// Returns every block category in palette display order.
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Trigger,
+            Self::Control,
+            Self::Action,
+            Self::Timing,
+            Self::Variable,
+            Self::Custom,
+        ]
+    }
 }
 
 /// Maximum number of additional simultaneous chord inputs allowed on a `TriggerBlock`.
@@ -314,6 +329,10 @@ pub enum StatementKind {
     MouseUp {
         mouse_button: MouseButton,
     },
+    MouseHoldWhilePressed {
+        button: MouseButton,
+        watch_input: InputTrigger,
+    },
     MouseMoveRelative {
         delta_x_px: i32,
         delta_y_px: i32,
@@ -358,6 +377,10 @@ pub enum StatementKind {
         variable_name: String,
         delta_value: f64,
     },
+    RunCustomBlock {
+        custom_block_id: String,
+        cached_name: String,
+    },
 }
 
 impl StatementKind {
@@ -374,6 +397,7 @@ impl StatementKind {
             Self::MouseClick { .. }
             | Self::MouseDown { .. }
             | Self::MouseUp { .. }
+            | Self::MouseHoldWhilePressed { .. }
             | Self::MouseMoveRelative { .. }
             | Self::MouseScroll { .. }
             | Self::KeyTap { .. }
@@ -384,6 +408,7 @@ impl StatementKind {
             | Self::WaitRandomUniform { .. }
             | Self::WaitRandomGaussian { .. } => BlockCategory::Timing,
             Self::SetVariable { .. } | Self::ChangeVariable { .. } => BlockCategory::Variable,
+            Self::RunCustomBlock { .. } => BlockCategory::Custom,
         }
     }
 
@@ -400,6 +425,7 @@ impl StatementKind {
             Self::MouseClick { .. } => "Mouse Click",
             Self::MouseDown { .. } => "Mouse Down",
             Self::MouseUp { .. } => "Mouse Up",
+            Self::MouseHoldWhilePressed { .. } => "Mouse Hold / Drag",
             Self::MouseMoveRelative { .. } => "Mouse Move",
             Self::MouseScroll { .. } => "Mouse Scroll",
             Self::KeyTap { .. } => "Key Tap",
@@ -411,6 +437,7 @@ impl StatementKind {
             Self::WaitRandomGaussian { .. } => "Wait Gaussian",
             Self::SetVariable { .. } => "Set Variable",
             Self::ChangeVariable { .. } => "Change Variable",
+            Self::RunCustomBlock { .. } => "Custom Tile",
         }
     }
 
@@ -581,6 +608,13 @@ impl VisualProgram {
         let mut emitted_buttons = Vec::new();
         block_tree::collect_emitted_buttons_in_slice(&self.statements, &mut emitted_buttons);
         emitted_buttons
+    }
+
+    /// Collects every distinct custom tile identifier referenced directly by this program.
+    pub fn referenced_custom_block_ids(&self) -> Vec<String> {
+        let mut referenced_ids = Vec::new();
+        block_tree::collect_custom_block_ids_in_slice(&self.statements, &mut referenced_ids);
+        referenced_ids
     }
 
     fn would_create_cycle(&self, source_block_id: BlockId, target_slot: BlockSlotTarget) -> bool {

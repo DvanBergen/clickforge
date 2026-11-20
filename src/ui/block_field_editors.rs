@@ -1,33 +1,40 @@
+mod condition_editor;
 mod key_picker;
 
-use std::fmt::Debug;
-use std::hash::Hash;
 use std::ops::RangeInclusive;
 
-use clickforge_sdk::{GaussianRangeMs, InputTrigger, MouseButton};
+use clickforge_sdk::GaussianRangeMs;
 use egui::{
-    Button, Color32, ComboBox, CornerRadius, DragValue, FontId, Frame, Id, Margin, Popup,
-    PopupCloseBehavior, Sense, Stroke, TextEdit, TextStyle, Ui, style::WidgetVisuals, vec2,
+    Button, Color32, CornerRadius, DragValue, FontId, Frame, Id, Margin, Popup, PopupCloseBehavior,
+    Sense, Stroke, TextEdit, TextStyle, Ui, style::WidgetVisuals, vec2,
 };
 
-use crate::models::{BlockId, ComparisonOperator, ConditionExpr, StatementKind};
+use crate::models::{BlockId, CustomBlockDefinition, StatementKind, lookup_custom_block};
 use crate::ui::theme::{
-    ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BORDER_STRONG, BlockVisualColors, CORNER_RADIUS_PILL_PX,
-    CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX, STATUS_DANGER_INK,
+    ACCENT_PRIMARY, BORDER_STRONG, BlockVisualColors, CORNER_RADIUS_PILL_PX, CORNER_RADIUS_SM_PX,
+    FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX, STATUS_DANGER_INK, STATUS_DANGER_SOLID,
     STATUS_RUNNING_INK, SURFACE_HOVER, TEXT_MUTED, TEXT_PRIMARY, font_family_mono_bold,
-    rich_mono_bold, rich_semibold,
+    rich_mono_bold, rich_semibold, truncate_display_text,
 };
 
 pub(crate) use key_picker::render_input_trigger_picker;
 
+use condition_editor::render_condition_editor;
 use key_picker::{render_key_code_picker, render_mouse_button_combo};
 
-const VARIABLE_INPUT_WIDTH_PX: f32 = 88.0;
+pub(super) const VARIABLE_INPUT_WIDTH_PX: f32 = 88.0;
 const TYPE_TEXT_WIDTH_PX: f32 = 148.0;
 const PILL_TEXT_SIZE_PX: f32 = 12.5;
 const BLOCK_LABEL_SIZE_PX: f32 = 13.5;
-const MAX_INLINE_CONDITION_DEPTH: usize = 2;
 const GAUSSIAN_POPUP_WIDTH_PX: f32 = 256.0;
+const MAX_CUSTOM_BLOCK_INLINE_NAME_CHARS: usize = 32;
+
+/// Outcome returned by `render_leaf_block_sentence`, capturing field edits and quick-edit clicks.
+#[derive(Debug, Default)]
+pub(crate) struct LeafBlockSentenceOutcome {
+    pub did_edit: bool,
+    pub edit_custom_block_id: Option<String>,
+}
 
 /// Applies recessed dark pill-well styling and bold tabular monospace digits inside a block row.
 pub(crate) fn with_pill_well_style<ResultType>(
@@ -85,9 +92,42 @@ pub(crate) fn with_pill_well_style<ResultType>(
     .inner
 }
 
+/// Renders inline editable parameter controls for any container or leaf statement block.
+pub(crate) fn render_statement_inline_fields(
+    ui: &mut Ui,
+    id_namespace: &str,
+    block_id: BlockId,
+    statement_kind: &mut StatementKind,
+    visual_colors: BlockVisualColors,
+    custom_blocks: &[CustomBlockDefinition],
+) -> bool {
+    let is_container = matches!(
+        statement_kind,
+        StatementKind::IfThen { .. }
+            | StatementKind::IfThenElse { .. }
+            | StatementKind::WhileCondition { .. }
+            | StatementKind::RepeatCount { .. }
+    );
+    if is_container {
+        render_container_block_sentence(ui, id_namespace, block_id, statement_kind, visual_colors)
+    } else {
+        render_leaf_block_sentence(
+            ui,
+            id_namespace,
+            block_id,
+            statement_kind,
+            visual_colors,
+            custom_blocks,
+            false,
+        )
+        .did_edit
+    }
+}
+
 /// Renders the natural-language header sentence inside a C-block container.
 pub(crate) fn render_container_block_sentence(
     ui: &mut Ui,
+    id_namespace: &str,
     block_id: BlockId,
     statement_kind: &mut StatementKind,
     visual_colors: BlockVisualColors,
@@ -104,7 +144,7 @@ pub(crate) fn render_container_block_sentence(
             );
             render_condition_editor(
                 ui,
-                Id::unique(("cond", block_id.0)),
+                Id::unique((id_namespace, "cond", block_id.0)),
                 condition,
                 visual_colors,
                 0,
@@ -125,15 +165,19 @@ pub(crate) fn render_container_block_sentence(
 /// Renders the natural-language sentence and pill inputs for every leaf statement block variant.
 pub(crate) fn render_leaf_block_sentence(
     ui: &mut Ui,
+    id_namespace: &str,
     block_id: BlockId,
     statement_kind: &mut StatementKind,
     visual_colors: BlockVisualColors,
-) -> bool {
+    custom_blocks: &[CustomBlockDefinition],
+    allow_quick_edit: bool,
+) -> LeafBlockSentenceOutcome {
     let is_press_down = matches!(
         statement_kind,
         StatementKind::MouseDown { .. } | StatementKind::KeyDown { .. }
     );
-    with_pill_well_style(ui, visual_colors, |ui| match statement_kind {
+    let mut outcome = LeafBlockSentenceOutcome::default();
+    outcome.did_edit = with_pill_well_style(ui, visual_colors, |ui| match statement_kind {
         StatementKind::BreakLoop => {
             render_lead_verb(ui, "Break Loop", visual_colors);
             false
@@ -152,7 +196,8 @@ pub(crate) fn render_leaf_block_sentence(
             hold_duration_ms,
         } => {
             render_lead_verb(ui, "Click", visual_colors);
-            let mut did_change = render_mouse_button_combo(ui, ("mc", block_id.0), mouse_button);
+            let mut did_change =
+                render_mouse_button_combo(ui, (id_namespace, "mc", block_id.0), mouse_button);
             did_change |= render_hold_duration_suffix(ui, hold_duration_ms, visual_colors);
             did_change
         }
@@ -162,7 +207,24 @@ pub(crate) fn render_leaf_block_sentence(
                 if is_press_down { "Hold" } else { "Release" },
                 visual_colors,
             );
-            render_mouse_button_combo(ui, ("mb", block_id.0), mouse_button)
+            render_mouse_button_combo(ui, (id_namespace, "mb", block_id.0), mouse_button)
+        }
+        StatementKind::MouseHoldWhilePressed {
+            button,
+            watch_input,
+        } => {
+            render_lead_verb(ui, "Hold", visual_colors);
+            let mut did_change =
+                render_mouse_button_combo(ui, (id_namespace, "mhw_btn", block_id.0), button);
+            render_muted_word(ui, "until", visual_colors);
+            did_change |= render_input_trigger_picker(
+                ui,
+                (id_namespace, "mhw_watch", block_id.0),
+                watch_input,
+                visual_colors,
+            );
+            render_muted_word(ui, "released", visual_colors);
+            did_change
         }
         StatementKind::MouseMoveRelative {
             delta_x_px,
@@ -195,8 +257,12 @@ pub(crate) fn render_leaf_block_sentence(
             hold_duration_ms,
         } => {
             render_lead_verb(ui, "Tap Key", visual_colors);
-            let mut did_change =
-                render_key_code_picker(ui, ("kt", block_id.0), key_code, visual_colors);
+            let mut did_change = render_key_code_picker(
+                ui,
+                (id_namespace, "kt", block_id.0),
+                key_code,
+                visual_colors,
+            );
             did_change |= render_hold_duration_suffix(ui, hold_duration_ms, visual_colors);
             did_change
         }
@@ -210,7 +276,12 @@ pub(crate) fn render_leaf_block_sentence(
                 },
                 visual_colors,
             );
-            render_key_code_picker(ui, ("kb", block_id.0), key_code, visual_colors)
+            render_key_code_picker(
+                ui,
+                (id_namespace, "kb", block_id.0),
+                key_code,
+                visual_colors,
+            )
         }
         StatementKind::TypeText {
             text,
@@ -252,6 +323,7 @@ pub(crate) fn render_leaf_block_sentence(
             std_dev_ms,
         } => render_gaussian_wait_sentence(
             ui,
+            id_namespace,
             block_id,
             base_delay_ms,
             min_offset_ms,
@@ -275,8 +347,113 @@ pub(crate) fn render_leaf_block_sentence(
             delta_value,
             visual_colors,
         ),
+        StatementKind::RunCustomBlock {
+            custom_block_id,
+            cached_name,
+        } => {
+            if let Some(requested_id) = render_custom_block_sentence(
+                ui,
+                custom_block_id,
+                cached_name,
+                visual_colors,
+                custom_blocks,
+                allow_quick_edit,
+            ) {
+                outcome.edit_custom_block_id = Some(requested_id);
+            }
+            false
+        }
         _ => false,
-    })
+    });
+    outcome
+}
+
+fn render_custom_block_sentence(
+    ui: &mut Ui,
+    custom_block_id: &str,
+    cached_name: &str,
+    visual_colors: BlockVisualColors,
+    custom_blocks: &[CustomBlockDefinition],
+    allow_quick_edit: bool,
+) -> Option<String> {
+    let Some(definition) = lookup_custom_block(custom_blocks, custom_block_id) else {
+        let fallback_name = if cached_name.trim().is_empty() {
+            "Deleted Tile"
+        } else {
+            cached_name.trim()
+        };
+        let short_name = truncate_display_text(fallback_name, MAX_CUSTOM_BLOCK_INLINE_NAME_CHARS);
+        ui.label(rich_semibold(
+            format!("★ {short_name}"),
+            BLOCK_LABEL_SIZE_PX,
+            STATUS_DANGER_INK,
+        ));
+        Frame::NONE
+            .fill(STATUS_DANGER_SOLID)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
+            .inner_margin(Margin::symmetric(7, 2))
+            .show(ui, |ui| {
+                ui.label(rich_semibold(
+                    "Missing Tile",
+                    FONT_SIZE_SMALL_PX,
+                    Color32::WHITE,
+                ));
+            });
+        return None;
+    };
+
+    let short_name = truncate_display_text(&definition.name, MAX_CUSTOM_BLOCK_INLINE_NAME_CHARS);
+    let title_response = ui.label(rich_semibold(
+        format!("★ {short_name}"),
+        BLOCK_LABEL_SIZE_PX,
+        visual_colors.text_primary,
+    ));
+    if !definition.description.trim().is_empty() {
+        title_response.on_hover_text(definition.description.trim());
+    }
+
+    let step_count = definition.total_block_count();
+    let step_label = if step_count == 1 {
+        "1 step".to_string()
+    } else {
+        format!("{step_count} steps")
+    };
+    Frame::NONE
+        .fill(visual_colors.badge_bg)
+        .stroke(Stroke::new(1.0, visual_colors.pill_well_border))
+        .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
+        .inner_margin(Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.label(rich_mono_bold(
+                step_label,
+                FONT_SIZE_SMALL_PX,
+                visual_colors.text_muted,
+            ));
+        });
+
+    if !allow_quick_edit {
+        return None;
+    }
+
+    let edit_button = Button::new(rich_semibold(
+        "Edit",
+        FONT_SIZE_SMALL_PX,
+        visual_colors.text_primary,
+    ))
+    .fill(visual_colors.pill_well_bg)
+    .stroke(Stroke::new(1.0, visual_colors.pill_well_border))
+    .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
+    .sense(Sense::click_and_drag());
+
+    if ui
+        .add(edit_button)
+        .on_hover_text("Edit this custom tile definition")
+        .clicked()
+    {
+        return Some(custom_block_id.to_string());
+    }
+    None
 }
 
 fn render_hold_duration_suffix(
@@ -299,7 +476,7 @@ fn render_lead_verb(ui: &mut Ui, verb_text: &str, visual_colors: BlockVisualColo
     ));
 }
 
-fn render_muted_word(ui: &mut Ui, word_text: &str, visual_colors: BlockVisualColors) {
+pub(super) fn render_muted_word(ui: &mut Ui, word_text: &str, visual_colors: BlockVisualColors) {
     ui.label(rich_semibold(
         word_text,
         FONT_SIZE_SMALL_PX,
@@ -311,7 +488,7 @@ fn render_u64_pill(ui: &mut Ui, value: &mut u64, bounds: RangeInclusive<u64>) ->
     ui.add(DragValue::new(value).range(bounds)).changed()
 }
 
-fn render_f64_pill(
+pub(super) fn render_f64_pill(
     ui: &mut Ui,
     value: &mut f64,
     bounds: RangeInclusive<f64>,
@@ -327,7 +504,12 @@ fn render_f64_pill(
     .changed()
 }
 
-fn render_mono_text_pill(ui: &mut Ui, text: &mut String, width_px: f32, hint_text: &str) -> bool {
+pub(super) fn render_mono_text_pill(
+    ui: &mut Ui,
+    text: &mut String,
+    width_px: f32,
+    hint_text: &str,
+) -> bool {
     ui.add(
         TextEdit::singleline(text)
             .desired_width(width_px)
@@ -340,6 +522,7 @@ fn render_mono_text_pill(ui: &mut Ui, text: &mut String, width_px: f32, hint_tex
 #[allow(clippy::too_many_arguments)]
 fn render_gaussian_wait_sentence(
     ui: &mut Ui,
+    id_namespace: &str,
     block_id: BlockId,
     base_delay_ms: &mut u64,
     min_offset_ms: &mut f64,
@@ -382,7 +565,7 @@ fn render_gaussian_wait_sentence(
         .add(pill)
         .on_hover_text("Tune Gaussian mean offset and standard deviation");
 
-    let popup_id = Id::unique(("gaussian_tune_popup", block_id.0));
+    let popup_id = Id::unique((id_namespace, "gaussian_tune_popup", block_id.0));
     Popup::from_toggle_button_response(&trigger_response)
         .id(popup_id)
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
@@ -490,231 +673,6 @@ fn render_variable_sentence(
     did_change |= ui
         .add(DragValue::new(numeric_value).speed(0.5).max_decimals(2))
         .changed();
-    did_change
-}
-
-fn render_condition_editor(
-    ui: &mut Ui,
-    widget_id: Id,
-    condition: &mut ConditionExpr,
-    visual_colors: BlockVisualColors,
-    nesting_depth: usize,
-) -> bool {
-    let mut did_change = render_condition_kind_combo(ui, widget_id, condition, nesting_depth);
-    let next_depth = nesting_depth.saturating_add(1);
-    let is_and_condition = matches!(condition, ConditionExpr::And { .. });
-    match condition {
-        ConditionExpr::IsInputPressed { input } => {
-            did_change |=
-                render_input_trigger_picker(ui, widget_id.with("in"), input, visual_colors);
-        }
-        ConditionExpr::RandomChance { chance_percent } => {
-            did_change |= render_f64_pill(ui, chance_percent, 0.0..=100.0, 1.0, 1);
-            render_muted_word(ui, "%", visual_colors);
-        }
-        ConditionExpr::CompareVariable {
-            variable_name,
-            operator,
-            target_value,
-        } => {
-            did_change |= render_mono_text_pill(ui, variable_name, VARIABLE_INPUT_WIDTH_PX, "var");
-            did_change |= render_comparison_operator_combo(ui, widget_id.with("op"), operator);
-            did_change |= ui
-                .add(DragValue::new(target_value).speed(0.5).max_decimals(2))
-                .changed();
-        }
-        ConditionExpr::Not { inner_condition } => {
-            did_change |= render_nested_condition_chip(
-                ui,
-                widget_id.with("not"),
-                inner_condition,
-                visual_colors,
-                next_depth,
-            );
-        }
-        ConditionExpr::And {
-            left_condition,
-            right_condition,
-        }
-        | ConditionExpr::Or {
-            left_condition,
-            right_condition,
-        } => {
-            let connector = if is_and_condition { "AND" } else { "OR" };
-            did_change |= render_nested_condition_chip(
-                ui,
-                widget_id.with((connector, "l")),
-                left_condition,
-                visual_colors,
-                next_depth,
-            );
-            Frame::NONE
-                .fill(ACCENT_PRIMARY_TINT)
-                .stroke(Stroke::new(1.0, ACCENT_PRIMARY))
-                .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
-                .inner_margin(Margin::symmetric(6, 2))
-                .show(ui, |ui| {
-                    ui.label(rich_mono_bold(
-                        connector,
-                        FONT_SIZE_SMALL_PX,
-                        ACCENT_PRIMARY,
-                    ));
-                });
-            did_change |= render_nested_condition_chip(
-                ui,
-                widget_id.with((connector, "r")),
-                right_condition,
-                visual_colors,
-                next_depth,
-            );
-        }
-    }
-    did_change
-}
-
-fn render_nested_condition_chip(
-    ui: &mut Ui,
-    widget_id: Id,
-    condition: &mut ConditionExpr,
-    visual_colors: BlockVisualColors,
-    nesting_depth: usize,
-) -> bool {
-    let mut did_change = false;
-    Frame::NONE
-        .fill(visual_colors.badge_bg)
-        .stroke(Stroke::new(1.0, visual_colors.pill_well_border))
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_PILL_PX))
-        .inner_margin(Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                did_change =
-                    render_condition_editor(ui, widget_id, condition, visual_colors, nesting_depth);
-            });
-        });
-    did_change
-}
-
-fn render_condition_kind_combo(
-    ui: &mut Ui,
-    widget_id: Id,
-    condition: &mut ConditionExpr,
-    nesting_depth: usize,
-) -> bool {
-    let mut did_change = false;
-    ComboBox::from_id_salt(widget_id.with(("cond_kind", nesting_depth)))
-        .selected_text(condition_variant_label(condition))
-        .width(124.0)
-        .show_ui(ui, |ui| {
-            let is_input = matches!(condition, ConditionExpr::IsInputPressed { .. });
-            if ui.selectable_label(is_input, "Input Pressed").clicked() {
-                *condition = ConditionExpr::IsInputPressed {
-                    input: InputTrigger::Mouse(MouseButton::Left),
-                };
-                did_change = true;
-            }
-            let is_chance = matches!(condition, ConditionExpr::RandomChance { .. });
-            if ui.selectable_label(is_chance, "Random Chance %").clicked() {
-                *condition = ConditionExpr::RandomChance {
-                    chance_percent: 50.0,
-                };
-                did_change = true;
-            }
-            let is_compare = matches!(condition, ConditionExpr::CompareVariable { .. });
-            if ui
-                .selectable_label(is_compare, "Compare Variable")
-                .clicked()
-            {
-                *condition = ConditionExpr::CompareVariable {
-                    variable_name: "counter".to_string(),
-                    operator: ComparisonOperator::LessThan,
-                    target_value: 10.0,
-                };
-                did_change = true;
-            }
-            if nesting_depth < MAX_INLINE_CONDITION_DEPTH {
-                ui.separator();
-                did_change |= render_compound_condition_options(ui, condition);
-            }
-        });
-    did_change
-}
-
-fn render_compound_condition_options(ui: &mut Ui, condition: &mut ConditionExpr) -> bool {
-    let mut did_change = false;
-    let is_not = matches!(condition, ConditionExpr::Not { .. });
-    if ui.selectable_label(is_not, "NOT (...)").clicked() && !is_not {
-        *condition = ConditionExpr::Not {
-            inner_condition: Box::new(condition.clone()),
-        };
-        did_change = true;
-    }
-    let is_and = matches!(condition, ConditionExpr::And { .. });
-    if ui.selectable_label(is_and, "AND (A & B)").clicked() && !is_and {
-        *condition = ConditionExpr::And {
-            left_condition: Box::new(extract_left_or_self(condition)),
-            right_condition: Box::new(ConditionExpr::IsInputPressed {
-                input: InputTrigger::Mouse(MouseButton::Right),
-            }),
-        };
-        did_change = true;
-    }
-    let is_or = matches!(condition, ConditionExpr::Or { .. });
-    if ui.selectable_label(is_or, "OR (A | B)").clicked() && !is_or {
-        *condition = ConditionExpr::Or {
-            left_condition: Box::new(extract_left_or_self(condition)),
-            right_condition: Box::new(ConditionExpr::RandomChance {
-                chance_percent: 50.0,
-            }),
-        };
-        did_change = true;
-    }
-    did_change
-}
-
-fn extract_left_or_self(condition: &ConditionExpr) -> ConditionExpr {
-    match condition {
-        ConditionExpr::And { left_condition, .. } | ConditionExpr::Or { left_condition, .. } => {
-            (**left_condition).clone()
-        }
-        other => other.clone(),
-    }
-}
-
-fn condition_variant_label(condition: &ConditionExpr) -> &'static str {
-    match condition {
-        ConditionExpr::IsInputPressed { .. } => "Input Pressed",
-        ConditionExpr::RandomChance { .. } => "Random Chance %",
-        ConditionExpr::CompareVariable { .. } => "Compare Variable",
-        ConditionExpr::Not { .. } => "NOT",
-        ConditionExpr::And { .. } => "All (AND)",
-        ConditionExpr::Or { .. } => "Any (OR)",
-    }
-}
-
-fn render_comparison_operator_combo<SaltType: Hash + Debug>(
-    ui: &mut Ui,
-    id_salt: SaltType,
-    operator: &mut ComparisonOperator,
-) -> bool {
-    const ALL_OPERATORS: [ComparisonOperator; 6] = [
-        ComparisonOperator::Equal,
-        ComparisonOperator::NotEqual,
-        ComparisonOperator::LessThan,
-        ComparisonOperator::LessOrEqual,
-        ComparisonOperator::GreaterThan,
-        ComparisonOperator::GreaterOrEqual,
-    ];
-    let mut did_change = false;
-    ComboBox::from_id_salt(id_salt)
-        .selected_text(operator.display_symbol())
-        .width(50.0)
-        .show_ui(ui, |ui| {
-            for candidate in ALL_OPERATORS {
-                did_change |= ui
-                    .selectable_value(operator, candidate, candidate.display_symbol())
-                    .changed();
-            }
-        });
     did_change
 }
 

@@ -1,27 +1,31 @@
+mod block_actions;
 mod geometry;
 
 use egui::{
-    Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Margin, PointerButton,
-    Popup, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Margin, PointerButton, Popup, Pos2,
+    Rect, Response, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
-use crate::models::{BlockId, BlockSlotTarget, StatementBlock, StatementKind, ValidationReport};
+use crate::models::{
+    BlockCategory, BlockId, BlockSlotTarget, CustomBlockDefinition, StatementBlock, StatementKind,
+    ValidationReport, lookup_custom_block,
+};
 use crate::ui::block_field_editors::{render_container_block_sentence, render_leaf_block_sentence};
 use crate::ui::block_palette::{BlockDragPayload, BlockDragState};
 use crate::ui::theme::{
     ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BORDER_SUBTLE, BlockVisualColors, CORNER_RADIUS_SM_PX,
-    FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_INK, STATUS_DANGER_SOLID, STATUS_DANGER_TINT,
-    STATUS_RUNNING, STATUS_RUNNING_TINT, TEXT_MUTED, TEXT_PRIMARY, block_visual_colors,
-    font_family_semibold, rich_semibold,
+    FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_SOLID, STATUS_DANGER_TINT, STATUS_RUNNING,
+    STATUS_RUNNING_TINT, TEXT_MUTED, TEXT_PRIMARY, block_visual_colors, custom_block_visual_colors,
+    font_family_semibold,
 };
 
 pub(crate) use geometry::{
     FULL_BLOCK_GEOMETRY, MINI_BLOCK_GEOMETRY, build_leaf_block_shapes, build_trigger_hat_shapes,
 };
 
+use block_actions::{render_block_context_menu, render_hover_trailing_actions};
 use geometry::{
-    C_BLOCK_SPINE_WIDTH_PX, build_c_block_shapes, paint_close_icon, paint_dashed_rect_border,
-    paint_duplicate_icon, with_alpha,
+    C_BLOCK_SPINE_WIDTH_PX, build_c_block_shapes, paint_dashed_rect_border, with_alpha,
 };
 
 pub(crate) const BLOCK_MIN_WIDTH_PX: f32 = 280.0;
@@ -36,12 +40,11 @@ const BLOCK_VERTICAL_GAP_PX: f32 = 0.0;
 const EMPTY_POCKET_HEIGHT_PX: f32 = 34.0;
 const EMPTY_ROOT_HEIGHT_PX: f32 = 46.0;
 const DRAG_DIM_OPACITY: f32 = 0.30;
-const HOVER_ACTION_SIZE_PX: f32 = 20.0;
-const HOVER_ACTION_GAP_PX: f32 = 4.0;
 const HOVER_RIGHT_RESERVE_PX: i8 = 54;
+const CANVAS_EDITOR_ID_NAMESPACE: &str = "canvas";
 
 /// Deferred structural tree mutation emitted while rendering statement blocks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum BlockRenderMutation {
     MarkDirty,
     MoveBlock {
@@ -53,19 +56,26 @@ pub enum BlockRenderMutation {
         insert_slot: BlockSlotTarget,
     },
     DeleteBlock(BlockId),
+    SaveBlockAsCustomTile(BlockId),
+    EditCustomBlock(String),
+    UnpackCustomBlock {
+        block_id: BlockId,
+        custom_block_id: String,
+    },
 }
 
 /// Shared read-only context passed down during recursive block rendering.
 pub struct BlockRenderContext<'frame> {
     pub active_block_id: Option<BlockId>,
     pub validation_report: &'frame ValidationReport,
+    pub custom_blocks: &'frame [CustomBlockDefinition],
     pub pointer_pos: Option<Pos2>,
 }
 
-struct BlockNavigationSlots {
-    move_up_slot: Option<BlockSlotTarget>,
-    move_down_slot: Option<BlockSlotTarget>,
-    duplicate_slot: BlockSlotTarget,
+pub(super) struct BlockNavigationSlots {
+    pub(super) move_up_slot: Option<BlockSlotTarget>,
+    pub(super) move_down_slot: Option<BlockSlotTarget>,
+    pub(super) duplicate_slot: BlockSlotTarget,
 }
 
 /// Renders a snapped stack of statement blocks and nested C-block branches with magnetic drop slots.
@@ -230,7 +240,8 @@ fn render_statement_node(
 ) {
     let block_id = block.id;
     let is_container = is_container_kind(&block.kind);
-    let visual_colors = block_visual_colors(block.kind.category());
+    let (visual_colors, is_missing_custom_tile) =
+        resolve_statement_visual_colors(&block.kind, render_context.custom_blocks);
     let is_active = render_context.active_block_id == Some(block_id);
     let validation_message =
         find_block_validation_message(render_context.validation_report, block_id);
@@ -259,23 +270,36 @@ fn render_statement_node(
                         ui.set_max_width(BLOCK_MAX_WIDTH_PX);
                         ui.horizontal_wrapped(|ui| {
                             paint_subtle_grip_dots(ui, visual_colors.text_muted);
-                            let did_edit = if is_container {
-                                render_container_block_sentence(
+                            if is_container {
+                                if render_container_block_sentence(
                                     ui,
+                                    CANVAS_EDITOR_ID_NAMESPACE,
                                     block_id,
                                     &mut block.kind,
                                     visual_colors,
-                                )
+                                ) {
+                                    mutations.push(BlockRenderMutation::MarkDirty);
+                                }
                             } else {
-                                render_leaf_block_sentence(
+                                let leaf_outcome = render_leaf_block_sentence(
                                     ui,
+                                    CANVAS_EDITOR_ID_NAMESPACE,
                                     block_id,
                                     &mut block.kind,
                                     visual_colors,
-                                )
-                            };
-                            if did_edit {
-                                mutations.push(BlockRenderMutation::MarkDirty);
+                                    render_context.custom_blocks,
+                                    true,
+                                );
+                                if leaf_outcome.did_edit {
+                                    mutations.push(BlockRenderMutation::MarkDirty);
+                                }
+                                if let Some(edit_custom_block_id) =
+                                    leaf_outcome.edit_custom_block_id
+                                {
+                                    mutations.push(BlockRenderMutation::EditCustomBlock(
+                                        edit_custom_block_id,
+                                    ));
+                                }
                             }
                         });
                     });
@@ -288,7 +312,7 @@ fn render_statement_node(
     let (fill_color, border_color, stroke_width_px) = resolve_block_surface_colors(
         visual_colors,
         is_active,
-        validation_message.is_some(),
+        validation_message.is_some() || is_missing_custom_tile,
         is_hovered,
     );
 
@@ -341,9 +365,26 @@ fn render_statement_node(
         block,
         &navigation_slots,
         validation_message,
+        render_context.custom_blocks,
         drag_state,
         mutations,
     );
+}
+
+fn resolve_statement_visual_colors(
+    statement_kind: &StatementKind,
+    custom_blocks: &[CustomBlockDefinition],
+) -> (BlockVisualColors, bool) {
+    if let StatementKind::RunCustomBlock {
+        custom_block_id, ..
+    } = statement_kind
+    {
+        return match lookup_custom_block(custom_blocks, custom_block_id) {
+            Some(definition) => (custom_block_visual_colors(definition.color), false),
+            None => (block_visual_colors(BlockCategory::Custom), true),
+        };
+    }
+    (block_visual_colors(statement_kind.category()), false)
 }
 
 fn is_container_kind(statement_kind: &StatementKind) -> bool {
@@ -494,6 +535,7 @@ fn handle_block_drag_and_menu(
     block: &StatementBlock,
     navigation_slots: &BlockNavigationSlots,
     validation_message: Option<&str>,
+    custom_blocks: &[CustomBlockDefinition],
     drag_state: &mut BlockDragState,
     mutations: &mut Vec<BlockRenderMutation>,
 ) {
@@ -503,12 +545,7 @@ fn handle_block_drag_and_menu(
         ui.ctx().set_cursor_icon(CursorIcon::Grab);
     }
     if !is_popup_open && header_response.drag_started_by(PointerButton::Primary) {
-        drag_state.start_drag(
-            BlockDragPayload::MoveExistingBlock(block.id),
-            block.kind.title(),
-            summarize_statement_for_ghost(&block.kind),
-            block.kind.category(),
-        );
+        start_existing_block_drag(block, custom_blocks, drag_state);
     }
 
     if is_hovered {
@@ -524,127 +561,37 @@ fn handle_block_drag_and_menu(
     }
 
     header_response.container_context_menu(|ui| {
-        render_block_context_menu(ui, block.id, navigation_slots, mutations);
+        render_block_context_menu(ui, block, navigation_slots, custom_blocks, mutations);
     });
 }
 
-fn render_hover_trailing_actions(
-    ui: &mut Ui,
-    header_rect: Rect,
-    block_id: BlockId,
-    duplicate_slot: BlockSlotTarget,
-    mutations: &mut Vec<BlockRenderMutation>,
+fn start_existing_block_drag(
+    block: &StatementBlock,
+    custom_blocks: &[CustomBlockDefinition],
+    drag_state: &mut BlockDragState,
 ) {
-    let notch_px = FULL_BLOCK_GEOMETRY.notch_depth_px;
-    let center_y_px = header_rect.min.y + notch_px + (header_rect.height() - notch_px) * 0.5;
-    let button_size = vec2(HOVER_ACTION_SIZE_PX, HOVER_ACTION_SIZE_PX);
-    let delete_rect =
-        Rect::from_center_size(pos2(header_rect.max.x - 16.0, center_y_px), button_size);
-    let duplicate_center_x = delete_rect.min.x - HOVER_ACTION_GAP_PX - (HOVER_ACTION_SIZE_PX * 0.5);
-    let duplicate_rect = Rect::from_center_size(pos2(duplicate_center_x, center_y_px), button_size);
-
-    let idle_fill = Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 76);
-    let duplicate_response = ui
-        .interact(
-            duplicate_rect,
-            Id::unique(("blk_dup", block_id.0)),
-            Sense::click_and_drag(),
-        )
-        .on_hover_text("Duplicate block");
-    let duplicate_fill = if duplicate_response.hovered() {
-        Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 44)
-    } else {
-        idle_fill
-    };
-    ui.painter().rect_filled(
-        duplicate_rect,
-        CornerRadius::same(CORNER_RADIUS_SM_PX),
-        duplicate_fill,
-    );
-    paint_duplicate_icon(ui.painter(), duplicate_rect.center(), TEXT_PRIMARY);
-    if duplicate_response.clicked() {
-        mutations.push(BlockRenderMutation::DuplicateBlock {
-            block_id,
-            insert_slot: duplicate_slot,
-        });
-    }
-
-    let delete_response = ui
-        .interact(
-            delete_rect,
-            Id::unique(("blk_del", block_id.0)),
-            Sense::click_and_drag(),
-        )
-        .on_hover_text("Delete block");
-    let (delete_fill, delete_ink) = if delete_response.hovered() {
-        (STATUS_DANGER_SOLID, TEXT_PRIMARY)
-    } else {
-        (idle_fill, STATUS_DANGER_INK)
-    };
-    ui.painter().rect_filled(
-        delete_rect,
-        CornerRadius::same(CORNER_RADIUS_SM_PX),
-        delete_fill,
-    );
-    paint_close_icon(ui.painter(), delete_rect.center(), delete_ink);
-    if delete_response.clicked() {
-        mutations.push(BlockRenderMutation::DeleteBlock(block_id));
-    }
-}
-
-fn render_block_context_menu(
-    ui: &mut Ui,
-    block_id: BlockId,
-    navigation_slots: &BlockNavigationSlots,
-    mutations: &mut Vec<BlockRenderMutation>,
-) {
-    ui.set_min_width(148.0);
-    if add_menu_item(ui, "Duplicate Block", TEXT_PRIMARY, true) {
-        mutations.push(BlockRenderMutation::DuplicateBlock {
-            block_id,
-            insert_slot: navigation_slots.duplicate_slot,
-        });
-        ui.close();
-    }
-    if add_menu_item(
-        ui,
-        "Move Up",
-        TEXT_PRIMARY,
-        navigation_slots.move_up_slot.is_some(),
-    ) && let Some(target_slot) = navigation_slots.move_up_slot
+    if let StatementKind::RunCustomBlock {
+        custom_block_id, ..
+    } = &block.kind
+        && let Some(definition) = lookup_custom_block(custom_blocks, custom_block_id)
     {
-        mutations.push(BlockRenderMutation::MoveBlock {
-            block_id,
-            target_slot,
-        });
-        ui.close();
+        let step_count = definition.total_block_count();
+        let step_word = if step_count == 1 { "step" } else { "steps" };
+        drag_state.start_custom_tile_drag(
+            BlockDragPayload::MoveExistingBlock(block.id),
+            format!("★ {}", definition.name),
+            format!("{step_count} {step_word}"),
+            definition.color,
+        );
+        return;
     }
-    if add_menu_item(
-        ui,
-        "Move Down",
-        TEXT_PRIMARY,
-        navigation_slots.move_down_slot.is_some(),
-    ) && let Some(target_slot) = navigation_slots.move_down_slot
-    {
-        mutations.push(BlockRenderMutation::MoveBlock {
-            block_id,
-            target_slot,
-        });
-        ui.close();
-    }
-    ui.separator();
-    if add_menu_item(ui, "Delete Block", STATUS_DANGER_INK, true) {
-        mutations.push(BlockRenderMutation::DeleteBlock(block_id));
-        ui.close();
-    }
-}
 
-fn add_menu_item(ui: &mut Ui, label: &str, color: Color32, is_enabled: bool) -> bool {
-    ui.add_enabled(
-        is_enabled,
-        Button::new(rich_semibold(label, FONT_SIZE_SMALL_PX, color)).frame(false),
-    )
-    .clicked()
+    drag_state.start_drag(
+        BlockDragPayload::MoveExistingBlock(block.id),
+        block.kind.title(),
+        summarize_statement_for_ghost(&block.kind),
+        block.kind.category(),
+    );
 }
 
 fn paint_subtle_grip_dots(ui: &mut Ui, dot_base_color: Color32) {
@@ -731,6 +678,14 @@ fn summarize_statement_for_ghost(statement_kind: &StatementKind) -> String {
         StatementKind::MouseDown { mouse_button } | StatementKind::MouseUp { mouse_button } => {
             mouse_button.display_label().to_string()
         }
+        StatementKind::MouseHoldWhilePressed {
+            button,
+            watch_input,
+        } => format!(
+            "{} while {}",
+            button.short_label(),
+            watch_input.display_label()
+        ),
         StatementKind::MouseMoveRelative {
             delta_x_px,
             delta_y_px,
@@ -763,5 +718,6 @@ fn summarize_statement_for_ghost(statement_kind: &StatementKind) -> String {
             variable_name,
             delta_value,
         } => format!("{variable_name} += {delta_value}"),
+        StatementKind::RunCustomBlock { cached_name, .. } => cached_name.clone(),
     }
 }

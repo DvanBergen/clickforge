@@ -1,3 +1,4 @@
+pub mod custom_block_repository;
 pub mod script_repository;
 pub mod settings_store;
 
@@ -12,6 +13,9 @@ use thiserror::Error;
 
 use crate::models::ValidationError;
 
+pub use custom_block_repository::{
+    CUSTOM_BLOCKS_FILE_NAME, CustomBlockRepository, MAX_CUSTOM_BLOCKS_FILE_BYTES,
+};
 pub use script_repository::{
     BACKUPS_SUBDIR_NAME, DEFAULT_CONFIG_DIR_NAME, MAX_SCRIPT_BACKUPS, MAX_SCRIPT_FILE_BYTES,
     SCRIPTS_SUBDIR_NAME, ScriptRepository,
@@ -33,6 +37,9 @@ pub enum StorageError {
         "Invalid script identifier '{script_id}': must be 1..=128 ASCII alphanumeric, '-' or '_' characters"
     )]
     InvalidScriptId { script_id: String },
+
+    #[error("Invalid custom block definition: {reason}")]
+    InvalidCustomBlock { reason: String },
 
     #[error("File '{path}' is {byte_count} bytes, exceeding limit of {max_bytes} bytes")]
     FileTooLarge {

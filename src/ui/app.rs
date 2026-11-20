@@ -1,23 +1,25 @@
+mod toasts;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clickforge_sdk::KeyCode;
 use egui::{
-    Align2, Area, Button, CentralPanel, Color32, CornerRadius, Event, Frame, Id, Margin, Order,
-    Panel, RichText, Stroke, Ui, ViewportCommand, vec2,
+    CentralPanel, CornerRadius, Event, Frame, Margin, Panel, RichText, Stroke, Ui, ViewportCommand,
 };
 use tracing::warn;
 
 use crate::engine::CoordinatorHandle;
 use crate::linux::WindowWatcher;
 use crate::models::{
-    CompileResultSnapshot, CoordinatorCommand, CoordinatorSnapshot, ScriptDocument,
-    ScriptExecutionPhase, ScriptMode, TrayUiEvent, inspect_script_validation,
+    CompileResultSnapshot, CoordinatorCommand, CoordinatorSnapshot, CustomBlockDefinition,
+    ScriptDocument, ScriptExecutionPhase, ScriptMode, TrayUiEvent,
+    inspect_script_validation_with_custom_blocks,
 };
-use crate::storage::{AppSettings, ScriptRepository, SettingsStore};
+use crate::storage::{AppSettings, CustomBlockRepository, ScriptRepository, SettingsStore};
 use crate::tray::SystemTrayHandle;
 use crate::ui::active_dashboard::{
     ActiveDashboardViewModel, render_active_dashboard, render_uinput_offline_banner,
@@ -28,6 +30,7 @@ use crate::ui::block_palette::{
     BlockDragState, PALETTE_DEFAULT_WIDTH_PX, PALETTE_MAX_WIDTH_PX, PALETTE_MIN_WIDTH_PX,
     render_block_palette,
 };
+use crate::ui::custom_block_modal::{CustomBlockModalState, render_custom_block_modal};
 use crate::ui::rust_editor_panel::render_rust_editor_panel;
 use crate::ui::script_settings_bar::{KeyCaptureTarget, render_script_settings_bar};
 use crate::ui::sidebar::{
@@ -37,25 +40,24 @@ use crate::ui::sidebar::{
 use crate::ui::target_picker_modal::{TargetPickerState, render_target_picker_modal};
 use crate::ui::telemetry_drawer::{GaussianHistogramCache, render_telemetry_drawer};
 use crate::ui::theme::{
-    ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE,
-    CORNER_RADIUS_MD_PX, CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX, FONT_SIZE_HEADING_PX,
-    FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_INK, STATUS_DANGER_TINT, STATUS_RUNNING,
-    STATUS_RUNNING_INK, STATUS_RUNNING_TINT, SURFACE_ELEVATED, SURFACE_PANEL, TEXT_MUTED,
-    TEXT_PRIMARY, build_panel_frame, map_egui_key_to_sdk_key, rich_bold, rich_semibold,
+    BG_CANVAS, BORDER_SUBTLE, CORNER_RADIUS_MD_PX, FONT_SIZE_BODY_PX, FONT_SIZE_HEADING_PX,
+    SURFACE_ELEVATED, SURFACE_PANEL, TEXT_MUTED, TEXT_PRIMARY, build_panel_frame,
+    map_egui_key_to_sdk_key, rich_bold,
 };
+
+pub(crate) use toasts::{DeletedScriptUndoEntry, StatusToast};
 
 const ACTIVE_REPAINT_INTERVAL_MS: u64 = 50;
 const IDLE_REPAINT_INTERVAL_MS: u64 = 250;
 const HIDDEN_REPAINT_INTERVAL_MS: u64 = 250;
-const STATUS_TOAST_DURATION_MS: u64 = 4_000;
-const TOAST_CLEARANCE_ABOVE_DRAWER_PX: f32 = 14.0;
-const TOAST_RIGHT_MARGIN_PX: f32 = 16.0;
 const WAYLAND_DISPLAY_ENV_VAR: &str = "WAYLAND_DISPLAY";
 
 /// Startup dependency bundle passed from `main.rs` into `ClickForgeWorkbenchApp`.
 pub struct WorkbenchLaunchBundle {
     pub scripts: Vec<ScriptDocument>,
+    pub custom_blocks: Vec<CustomBlockDefinition>,
     pub repository: ScriptRepository,
+    pub custom_block_repository: CustomBlockRepository,
     pub settings_store: SettingsStore,
     pub settings: AppSettings,
     pub coordinator: CoordinatorHandle,
@@ -63,18 +65,6 @@ pub struct WorkbenchLaunchBundle {
     pub tray_handle: Option<Arc<SystemTrayHandle>>,
     pub tray_event_receiver: Receiver<TrayUiEvent>,
     pub shutdown_flag: Arc<AtomicBool>,
-}
-
-pub(crate) struct StatusToast {
-    pub(crate) message: String,
-    pub(crate) is_error: bool,
-    pub(crate) expires_at: Instant,
-}
-
-pub(crate) struct DeletedScriptUndoEntry {
-    pub(crate) script: ScriptDocument,
-    pub(crate) original_index: usize,
-    pub(crate) expires_at: Instant,
 }
 
 /// Top-level workspace tab switching between the live control center and script editor.
@@ -89,9 +79,11 @@ pub enum WorkbenchTab {
 pub struct ClickForgeWorkbenchApp {
     pub(crate) active_tab: WorkbenchTab,
     pub(crate) scripts: Vec<ScriptDocument>,
+    pub(crate) custom_blocks: Vec<CustomBlockDefinition>,
     pub(crate) selected_script_id: Option<String>,
     pub(crate) dirty_script_ids: HashSet<String>,
     pub(crate) repository: ScriptRepository,
+    pub(crate) custom_block_repository: CustomBlockRepository,
     pub(crate) settings_store: SettingsStore,
     pub(crate) settings: AppSettings,
     pub(crate) coordinator: CoordinatorHandle,
@@ -103,6 +95,7 @@ pub struct ClickForgeWorkbenchApp {
     pub(crate) active_key_capture: Option<KeyCaptureTarget>,
     pub(crate) target_picker_state: TargetPickerState,
     pub(crate) new_script_modal_state: NewScriptModalState,
+    pub(crate) custom_block_modal_state: CustomBlockModalState,
     block_drag_state: BlockDragState,
     histogram_cache: GaussianHistogramCache,
     pub(crate) visual_history_by_script_id: HashMap<String, VisualProgramHistory>,
@@ -125,9 +118,11 @@ impl ClickForgeWorkbenchApp {
         Self {
             active_tab: WorkbenchTab::Active,
             scripts: bundle.scripts,
+            custom_blocks: bundle.custom_blocks,
             selected_script_id: initial_selected_id,
             dirty_script_ids: HashSet::new(),
             repository: bundle.repository,
+            custom_block_repository: bundle.custom_block_repository,
             settings_store: bundle.settings_store,
             settings: bundle.settings,
             coordinator: bundle.coordinator,
@@ -139,6 +134,7 @@ impl ClickForgeWorkbenchApp {
             active_key_capture: None,
             target_picker_state: TargetPickerState::default(),
             new_script_modal_state: NewScriptModalState::default(),
+            custom_block_modal_state: CustomBlockModalState::default(),
             block_drag_state: BlockDragState::default(),
             histogram_cache: GaussianHistogramCache::default(),
             visual_history_by_script_id: HashMap::new(),
@@ -148,14 +144,6 @@ impl ClickForgeWorkbenchApp {
             should_allow_window_close: false,
             did_apply_initial_visibility: false,
         }
-    }
-
-    pub(crate) fn show_toast(&mut self, message: impl Into<String>, is_error: bool) {
-        self.status_toast = Some(StatusToast {
-            message: message.into(),
-            is_error,
-            expires_at: Instant::now() + Duration::from_millis(STATUS_TOAST_DURATION_MS),
-        });
     }
 
     pub(crate) fn active_script_index(&self) -> Option<usize> {
@@ -304,130 +292,6 @@ impl ClickForgeWorkbenchApp {
         self.show_toast(toast_message, false);
     }
 
-    fn render_toasts(&mut self, egui_context: &egui::Context, rendered_drawer_height_px: f32) {
-        let toast_offset_y_px = -(rendered_drawer_height_px + TOAST_CLEARANCE_ABOVE_DRAWER_PX);
-        if self.render_deleted_script_undo_toast(egui_context, toast_offset_y_px) {
-            return;
-        }
-        self.render_status_toast(egui_context, toast_offset_y_px);
-    }
-
-    fn render_deleted_script_undo_toast(
-        &mut self,
-        egui_context: &egui::Context,
-        toast_offset_y_px: f32,
-    ) -> bool {
-        let Some(entry) = &self.last_deleted_script else {
-            return false;
-        };
-        let now = Instant::now();
-        if now >= entry.expires_at {
-            self.last_deleted_script = None;
-            return false;
-        }
-
-        let remaining_seconds = entry
-            .expires_at
-            .saturating_duration_since(now)
-            .as_secs()
-            .saturating_add(1);
-        let script_name = entry.script.name.clone();
-        let mut should_restore = false;
-        let mut should_dismiss = false;
-
-        Area::new(Id::unique("workbench_undo_delete_toast"))
-            .order(Order::Foreground)
-            .anchor(
-                Align2::RIGHT_BOTTOM,
-                vec2(-TOAST_RIGHT_MARGIN_PX, toast_offset_y_px),
-            )
-            .interactable(true)
-            .show(egui_context, |ui| {
-                Frame::NONE
-                    .fill(SURFACE_PANEL)
-                    .stroke(Stroke::new(1.0, BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(CORNER_RADIUS_MD_PX))
-                    .shadow(ui.style().visuals.popup_shadow)
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.label(rich_semibold(
-                                format!("Deleted '{script_name}' ({remaining_seconds}s)"),
-                                FONT_SIZE_SMALL_PX,
-                                TEXT_PRIMARY,
-                            ));
-                            let undo_button = Button::new(rich_semibold(
-                                "Undo",
-                                FONT_SIZE_SMALL_PX,
-                                ACCENT_PRIMARY,
-                            ))
-                            .fill(ACCENT_PRIMARY_TINT)
-                            .stroke(Stroke::new(1.0, ACCENT_PRIMARY))
-                            .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-                            .min_size(vec2(0.0, 22.0));
-                            if ui.add(undo_button).clicked() {
-                                should_restore = true;
-                            }
-                            let dismiss_button =
-                                Button::new(rich_semibold("×", FONT_SIZE_SMALL_PX, TEXT_MUTED))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(vec2(20.0, 22.0));
-                            if ui.add(dismiss_button).clicked() {
-                                should_dismiss = true;
-                            }
-                        });
-                    });
-            });
-
-        if should_restore {
-            self.restore_last_deleted_script();
-        } else if should_dismiss {
-            self.last_deleted_script = None;
-        }
-        true
-    }
-
-    fn render_status_toast(&mut self, egui_context: &egui::Context, toast_offset_y_px: f32) {
-        let Some(toast) = &self.status_toast else {
-            return;
-        };
-        if Instant::now() >= toast.expires_at {
-            self.status_toast = None;
-            return;
-        }
-
-        let (fill_color, border_color, text_color) = if toast.is_error {
-            (STATUS_DANGER_TINT, STATUS_DANGER, STATUS_DANGER_INK)
-        } else {
-            (STATUS_RUNNING_TINT, STATUS_RUNNING, STATUS_RUNNING_INK)
-        };
-
-        Area::new(Id::unique("workbench_status_toast"))
-            .order(Order::Foreground)
-            .anchor(
-                Align2::RIGHT_BOTTOM,
-                vec2(-TOAST_RIGHT_MARGIN_PX, toast_offset_y_px),
-            )
-            .interactable(false)
-            .show(egui_context, |ui| {
-                Frame::NONE
-                    .fill(fill_color)
-                    .stroke(Stroke::new(1.0, border_color))
-                    .corner_radius(CornerRadius::same(CORNER_RADIUS_MD_PX))
-                    .shadow(ui.style().visuals.popup_shadow)
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.label(rich_semibold(
-                            &toast.message,
-                            FONT_SIZE_SMALL_PX,
-                            text_color,
-                        ));
-                    });
-            });
-    }
-
     fn latest_compile_result_for_script(&self, script_id: &str) -> Option<CompileResultSnapshot> {
         if let Some(specific_result) = self.coordinator.last_compile_result(script_id) {
             return Some(specific_result);
@@ -446,6 +310,7 @@ impl ClickForgeWorkbenchApp {
             .show(ui, |ui| {
                 let dashboard_view = ActiveDashboardViewModel {
                     scripts: &self.scripts,
+                    custom_blocks: &self.custom_blocks,
                     selected_script_id: self.selected_script_id.as_deref(),
                     dirty_script_ids: &self.dirty_script_ids,
                     snapshot: &self.latest_snapshot,
@@ -471,6 +336,7 @@ impl ClickForgeWorkbenchApp {
                 render_script_settings_bar(
                     ui,
                     active_script_mut,
+                    &self.custom_blocks,
                     is_active_dirty,
                     self.active_key_capture,
                     &self.latest_snapshot,
@@ -491,7 +357,12 @@ impl ClickForgeWorkbenchApp {
                 .max_size(PALETTE_MAX_WIDTH_PX)
                 .frame(build_panel_frame(SURFACE_PANEL, 10, 10))
                 .show(ui, |ui| {
-                    render_block_palette(ui, &mut self.block_drag_state, &mut palette_actions);
+                    render_block_palette(
+                        ui,
+                        &self.custom_blocks,
+                        &mut self.block_drag_state,
+                        &mut palette_actions,
+                    );
                 });
             self.apply_palette_actions(palette_actions);
         }
@@ -522,7 +393,10 @@ impl ClickForgeWorkbenchApp {
                 let runtime_phase = runtime_status
                     .map(|status| status.phase)
                     .unwrap_or(ScriptExecutionPhase::Disabled);
-                let validation_report = inspect_script_validation(&self.scripts[script_index]);
+                let validation_report = inspect_script_validation_with_custom_blocks(
+                    &self.scripts[script_index],
+                    &self.custom_blocks,
+                );
 
                 match self.scripts[script_index].mode {
                     ScriptMode::VisualBlocks => render_block_canvas(
@@ -530,6 +404,7 @@ impl ClickForgeWorkbenchApp {
                         &mut self.scripts[script_index],
                         active_block_id,
                         &validation_report,
+                        &self.custom_blocks,
                         &mut self.block_drag_state,
                         &mut canvas_actions,
                     ),
@@ -609,6 +484,7 @@ impl eframe::App for ClickForgeWorkbenchApp {
                 let sidebar_view = SidebarViewModel {
                     active_tab: self.active_tab,
                     scripts: &self.scripts,
+                    custom_blocks: &self.custom_blocks,
                     selected_script_id: self.selected_script_id.as_deref(),
                     dirty_script_ids: &self.dirty_script_ids,
                     snapshot: &self.latest_snapshot,
@@ -680,6 +556,15 @@ impl eframe::App for ClickForgeWorkbenchApp {
             &mut modal_sidebar_actions,
         );
         self.apply_sidebar_actions(&egui_context, modal_sidebar_actions);
+
+        let mut custom_block_modal_actions = Vec::new();
+        render_custom_block_modal(
+            &egui_context,
+            &mut self.custom_block_modal_state,
+            &self.custom_blocks,
+            &mut custom_block_modal_actions,
+        );
+        self.apply_custom_block_modal_actions(custom_block_modal_actions);
 
         self.render_toasts(&egui_context, rendered_drawer_height_px);
     }

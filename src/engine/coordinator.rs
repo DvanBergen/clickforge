@@ -10,8 +10,8 @@ use clickforge_sdk::{InputTrigger, KeyCode};
 use crate::engine::coordinator_loop::CoordinatorLoop;
 use crate::models::{
     ActiveWindowSnapshot, CompileResultSnapshot, CoordinatorCommand, CoordinatorSnapshot,
-    InputSink, InputSubsystemStatus, PhysicalInputReader, RunningProcessEntry, ScriptDocument,
-    TrayRuntimeState, TriggerInterceptControl,
+    CustomBlockDefinition, InputSink, InputSubsystemStatus, PhysicalInputReader,
+    RunningProcessEntry, ScriptDocument, TrayRuntimeState, TriggerInterceptControl,
 };
 
 const MAX_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -29,6 +29,7 @@ pub type WindowSnapshotProvider = Arc<
 /// Dependency injection bundle used to launch the background script coordinator thread.
 pub struct CoordinatorStartConfig {
     pub initial_scripts: Vec<ScriptDocument>,
+    pub initial_custom_blocks: Vec<CustomBlockDefinition>,
     pub input_sink: Arc<dyn InputSink>,
     pub physical_input: Arc<dyn PhysicalInputReader>,
     pub trigger_intercept: Arc<dyn TriggerInterceptControl>,

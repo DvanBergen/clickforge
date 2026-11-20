@@ -1,4 +1,4 @@
-use clickforge_sdk::{KeyCode, MouseButton};
+use clickforge_sdk::{InputTrigger, KeyCode, MouseButton};
 
 use crate::models::blocks::{BlockId, BlockSlotTarget, StatementBlock, StatementKind};
 
@@ -325,11 +325,17 @@ pub(crate) fn collect_condition_keys_in_slice(
     collected_keys: &mut Vec<KeyCode>,
 ) {
     for block in statements {
-        if let StatementKind::IfThen { condition, .. }
-        | StatementKind::IfThenElse { condition, .. }
-        | StatementKind::WhileCondition { condition, .. } = &block.kind
-        {
-            condition.collect_referenced_keys(collected_keys);
+        match &block.kind {
+            StatementKind::IfThen { condition, .. }
+            | StatementKind::IfThenElse { condition, .. }
+            | StatementKind::WhileCondition { condition, .. } => {
+                condition.collect_referenced_keys(collected_keys);
+            }
+            StatementKind::MouseHoldWhilePressed {
+                watch_input: InputTrigger::Key(key_code),
+                ..
+            } => push_unique_key(collected_keys, *key_code),
+            _ => {}
         }
         let (primary_children, secondary_children) = child_slices(&block.kind);
         collect_condition_keys_in_slice(primary_children, collected_keys);
@@ -342,16 +348,81 @@ pub(crate) fn collect_emitted_buttons_in_slice(
     collected_buttons: &mut Vec<MouseButton>,
 ) {
     for block in statements {
-        if let StatementKind::MouseClick { mouse_button, .. }
-        | StatementKind::MouseDown { mouse_button }
-        | StatementKind::MouseUp { mouse_button } = &block.kind
-            && !collected_buttons.contains(mouse_button)
+        let maybe_button = match &block.kind {
+            StatementKind::MouseClick { mouse_button, .. }
+            | StatementKind::MouseDown { mouse_button }
+            | StatementKind::MouseUp { mouse_button } => Some(*mouse_button),
+            StatementKind::MouseHoldWhilePressed { button, .. } => Some(*button),
+            _ => None,
+        };
+        if let Some(mouse_button) = maybe_button
+            && !collected_buttons.contains(&mouse_button)
         {
-            collected_buttons.push(*mouse_button);
+            collected_buttons.push(mouse_button);
         }
         let (primary_children, secondary_children) = child_slices(&block.kind);
         collect_emitted_buttons_in_slice(primary_children, collected_buttons);
         collect_emitted_buttons_in_slice(secondary_children, collected_buttons);
+    }
+}
+
+pub(crate) fn collect_custom_block_ids_in_slice(
+    statements: &[StatementBlock],
+    collected_ids: &mut Vec<String>,
+) {
+    for block in statements {
+        if let StatementKind::RunCustomBlock {
+            custom_block_id, ..
+        } = &block.kind
+            && !collected_ids
+                .iter()
+                .any(|existing| existing == custom_block_id)
+        {
+            collected_ids.push(custom_block_id.clone());
+        }
+        let (primary_children, secondary_children) = child_slices(&block.kind);
+        collect_custom_block_ids_in_slice(primary_children, collected_ids);
+        collect_custom_block_ids_in_slice(secondary_children, collected_ids);
+    }
+}
+
+pub(crate) fn reallocate_block_ids_in_slice(
+    statements: Vec<StatementBlock>,
+    next_block_id: &mut u64,
+) -> Vec<StatementBlock> {
+    let mut reallocated = Vec::with_capacity(statements.len());
+    for mut block in statements {
+        let allocated_id = (*next_block_id).max(1);
+        *next_block_id = allocated_id.saturating_add(1);
+        block.id = BlockId(allocated_id);
+        reallocate_nested_children(&mut block.kind, next_block_id);
+        reallocated.push(block);
+    }
+    reallocated
+}
+
+fn reallocate_nested_children(kind: &mut StatementKind, next_block_id: &mut u64) {
+    match kind {
+        StatementKind::IfThen { then_blocks, .. } => {
+            let owned_then = std::mem::take(then_blocks);
+            *then_blocks = reallocate_block_ids_in_slice(owned_then, next_block_id);
+        }
+        StatementKind::IfThenElse {
+            then_blocks,
+            else_blocks,
+            ..
+        } => {
+            let owned_then = std::mem::take(then_blocks);
+            let owned_else = std::mem::take(else_blocks);
+            *then_blocks = reallocate_block_ids_in_slice(owned_then, next_block_id);
+            *else_blocks = reallocate_block_ids_in_slice(owned_else, next_block_id);
+        }
+        StatementKind::WhileCondition { body_blocks, .. }
+        | StatementKind::RepeatCount { body_blocks, .. } => {
+            let owned_body = std::mem::take(body_blocks);
+            *body_blocks = reallocate_block_ids_in_slice(owned_body, next_block_id);
+        }
+        _ => {}
     }
 }
 

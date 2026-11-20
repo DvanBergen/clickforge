@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use clickforge::engine::{CoordinatorStartConfig, start_coordinator};
 use clickforge::linux::create_linux_runtime;
 use clickforge::models::TrayUiEvent;
-use clickforge::storage::{AppSettings, ScriptRepository, SettingsStore};
+use clickforge::storage::{AppSettings, CustomBlockRepository, ScriptRepository, SettingsStore};
 use clickforge::tray::spawn_system_tray;
 use clickforge::ui::{ClickForgeWorkbenchApp, WorkbenchLaunchBundle, apply_forge_slate_theme};
 
@@ -89,6 +89,22 @@ fn main() -> ExitCode {
         }
     };
 
+    let custom_block_repository = match CustomBlockRepository::new_default() {
+        Ok(custom_repository) => custom_repository,
+        Err(storage_error) => {
+            error!("Failed to initialize ClickForge custom block repository: {storage_error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let initial_custom_blocks = match custom_block_repository.load_all() {
+        Ok(loaded_tiles) => loaded_tiles,
+        Err(load_error) => {
+            warn!("Failed to read custom_blocks.json, starting with empty library: {load_error}");
+            Vec::new()
+        }
+    };
+
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shared_egui_context: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
     spawn_signal_bridge_thread(Arc::clone(&shutdown_flag), Arc::clone(&shared_egui_context));
@@ -125,6 +141,7 @@ fn main() -> ExitCode {
 
     let coordinator_config = CoordinatorStartConfig {
         initial_scripts: initial_scripts.clone(),
+        initial_custom_blocks: initial_custom_blocks.clone(),
         input_sink: linux_runtime.input_sink,
         physical_input: linux_runtime.physical_input,
         trigger_intercept: linux_runtime.trigger_intercept,
@@ -150,7 +167,9 @@ fn main() -> ExitCode {
 
     let launch_bundle = WorkbenchLaunchBundle {
         scripts: initial_scripts,
+        custom_blocks: initial_custom_blocks,
         repository,
+        custom_block_repository,
         settings_store,
         settings,
         coordinator,

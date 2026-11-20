@@ -6,7 +6,7 @@ use std::time::Duration;
 use clickforge_sdk::{InputTrigger, KeyCode, MouseButton};
 
 use super::*;
-use crate::models::{ComparisonOperator, InputError};
+use crate::models::{ComparisonOperator, CustomBlockColor, CustomBlockDefinition, InputError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedEvent {
@@ -434,5 +434,280 @@ fn if_then_else_with_do_nothing_branch_executes_without_emitting_actions() -> Re
         .map(|guard| guard.clone())
         .unwrap_or_default();
     assert!(visited.contains(&noop_block_id));
+    Ok(())
+}
+
+#[test]
+fn mouse_hold_while_pressed_holds_across_ticks_and_releases_on_physical_release()
+-> Result<(), String> {
+    let mut program = VisualProgram::new(TriggerBlock::LoopWhileActive);
+    program.append_root_block(StatementKind::MouseHoldWhilePressed {
+        button: MouseButton::Left,
+        watch_input: InputTrigger::Mouse(MouseButton::Left),
+    });
+    program.append_root_block(StatementKind::StopScript);
+
+    let mock_sink = Arc::new(MockInputSink::default());
+    let mock_physical = Arc::new(MockPhysicalInput::default());
+    mock_physical
+        .is_left_mouse_held
+        .store(true, Ordering::SeqCst);
+
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let worker_sink = Arc::clone(&mock_sink);
+    let worker_physical = Arc::clone(&mock_physical);
+    let worker_abort = Arc::clone(&abort_flag);
+
+    let worker_handle = std::thread::spawn(move || {
+        let mut hooks = BlockExecutionHooks::default();
+        execute_visual_program(
+            &program,
+            worker_sink,
+            worker_physical,
+            &worker_abort,
+            &mut hooks,
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(30));
+    let mid_hold_events = mock_sink.snapshot_events();
+    assert_eq!(
+        mid_hold_events,
+        vec![RecordedEvent::MouseDown(MouseButton::Left)]
+    );
+
+    mock_physical
+        .is_left_mouse_held
+        .store(false, Ordering::SeqCst);
+
+    let stop_reason = match worker_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err("mouse hold test thread panicked".to_string()),
+    };
+    assert_eq!(stop_reason, ProgramStopReason::StoppedByBlock);
+    assert_eq!(
+        mock_sink.snapshot_events(),
+        vec![
+            RecordedEvent::MouseDown(MouseButton::Left),
+            RecordedEvent::MouseUp(MouseButton::Left),
+            RecordedEvent::ReleaseAll,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn mouse_hold_while_pressed_skips_when_unpressed_and_releases_on_emergency_abort()
+-> Result<(), String> {
+    let mut program = VisualProgram::new(TriggerBlock::LoopWhileActive);
+    program.append_root_block(StatementKind::MouseHoldWhilePressed {
+        button: MouseButton::Left,
+        watch_input: InputTrigger::Mouse(MouseButton::Left),
+    });
+    program.append_root_block(StatementKind::StopScript);
+
+    let skipped_sink = Arc::new(MockInputSink::default());
+    let unpressed_physical = Arc::new(MockPhysicalInput::default());
+    let abort_flag = AtomicBool::new(false);
+    let mut hooks = BlockExecutionHooks::default();
+    let skip_reason = execute_visual_program(
+        &program,
+        Arc::clone(&skipped_sink) as Arc<dyn InputSink>,
+        unpressed_physical,
+        &abort_flag,
+        &mut hooks,
+    )?;
+    assert_eq!(skip_reason, ProgramStopReason::StoppedByBlock);
+    assert_eq!(
+        skipped_sink.snapshot_events(),
+        vec![RecordedEvent::ReleaseAll]
+    );
+
+    let abort_sink = Arc::new(MockInputSink::default());
+    let held_physical = Arc::new(MockPhysicalInput::default());
+    held_physical
+        .is_left_mouse_held
+        .store(true, Ordering::SeqCst);
+    let emergency_abort = Arc::new(AtomicBool::new(false));
+    let worker_sink = Arc::clone(&abort_sink);
+    let worker_physical = Arc::clone(&held_physical);
+    let worker_abort = Arc::clone(&emergency_abort);
+
+    let worker_handle = std::thread::spawn(move || {
+        let mut worker_hooks = BlockExecutionHooks::default();
+        execute_visual_program(
+            &program,
+            worker_sink,
+            worker_physical,
+            &worker_abort,
+            &mut worker_hooks,
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+    emergency_abort.store(true, Ordering::SeqCst);
+
+    let stop_reason = match worker_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err("mouse hold abort test thread panicked".to_string()),
+    };
+    assert_eq!(stop_reason, ProgramStopReason::Aborted);
+    assert_eq!(
+        abort_sink.snapshot_events(),
+        vec![
+            RecordedEvent::MouseDown(MouseButton::Left),
+            RecordedEvent::MouseUp(MouseButton::Left),
+            RecordedEvent::ReleaseAll,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn run_custom_block_executes_nested_tiles_and_guards_cycles_and_depth() -> Result<(), String> {
+    let mut inner_tile = CustomBlockDefinition::from_statements(
+        "Inner Increment",
+        "Increments combo and taps E",
+        CustomBlockColor::Teal,
+        vec![
+            StatementBlock {
+                id: BlockId(1),
+                kind: StatementKind::ChangeVariable {
+                    variable_name: "combo".to_string(),
+                    delta_value: 2.0,
+                },
+            },
+            StatementBlock {
+                id: BlockId(2),
+                kind: StatementKind::KeyTap {
+                    key_code: KeyCode::E,
+                    hold_duration_ms: 1,
+                },
+            },
+        ],
+    );
+    inner_tile.id = "tile-inner".to_string();
+
+    let mut outer_tile = CustomBlockDefinition::from_statements(
+        "Outer Combo",
+        "Calls inner tile",
+        CustomBlockColor::Coral,
+        vec![
+            StatementBlock {
+                id: BlockId(1),
+                kind: StatementKind::RunCustomBlock {
+                    custom_block_id: "tile-inner".to_string(),
+                    cached_name: "Inner Increment".to_string(),
+                },
+            },
+            StatementBlock {
+                id: BlockId(2),
+                kind: StatementKind::MouseClick {
+                    mouse_button: MouseButton::Left,
+                    hold_duration_ms: 1,
+                },
+            },
+        ],
+    );
+    outer_tile.id = "tile-outer".to_string();
+
+    let mut program = VisualProgram::new(TriggerBlock::LoopWhileActive);
+    program.append_root_block(StatementKind::SetVariable {
+        variable_name: "combo".to_string(),
+        value: 1.0,
+    });
+    let custom_call_id = program.append_root_block(StatementKind::RunCustomBlock {
+        custom_block_id: "tile-outer".to_string(),
+        cached_name: "Outer Combo".to_string(),
+    });
+    let confirm_block = program.create_block(StatementKind::KeyTap {
+        key_code: KeyCode::Space,
+        hold_duration_ms: 1,
+    });
+    program.append_root_block(StatementKind::IfThen {
+        condition: ConditionExpr::CompareVariable {
+            variable_name: "combo".to_string(),
+            operator: ComparisonOperator::Equal,
+            target_value: 3.0,
+        },
+        then_blocks: vec![confirm_block],
+    });
+    program.append_root_block(StatementKind::StopScript);
+
+    let mock_sink = Arc::new(MockInputSink::default());
+    let mock_physical = Arc::new(MockPhysicalInput::default());
+    let abort_flag = AtomicBool::new(false);
+    let visited_ids = Arc::new(Mutex::new(Vec::<BlockId>::new()));
+    let hook_visited = Arc::clone(&visited_ids);
+    let mut hooks = BlockExecutionHooks {
+        on_active_block_changed: Some(Box::new(move |maybe_block_id| {
+            if let Some(block_id) = maybe_block_id
+                && let Ok(mut guard) = hook_visited.lock()
+            {
+                guard.push(block_id);
+            }
+        })),
+        on_delay_sampled_ms: None,
+        on_action_executed: None,
+    };
+
+    let library = vec![outer_tile, inner_tile];
+    let stop_reason = execute_visual_program_with_request(
+        VisualExecutionRequest {
+            program: &program,
+            custom_blocks: &library,
+            input_sink: Arc::clone(&mock_sink) as Arc<dyn InputSink>,
+            physical_input: mock_physical,
+            abort_flag: &abort_flag,
+        },
+        &mut hooks,
+    )?;
+    assert_eq!(stop_reason, ProgramStopReason::StoppedByBlock);
+    let events = mock_sink.snapshot_events();
+    assert!(events.contains(&RecordedEvent::KeyDown(KeyCode::E)));
+    assert!(events.contains(&RecordedEvent::MouseDown(MouseButton::Left)));
+    assert!(events.contains(&RecordedEvent::KeyDown(KeyCode::Space)));
+    assert_eq!(events.last(), Some(&RecordedEvent::ReleaseAll));
+    let visited = visited_ids
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    assert!(visited.contains(&custom_call_id));
+
+    let mut cyclic_tile = CustomBlockDefinition::from_statements(
+        "Cyclic Tile",
+        "",
+        CustomBlockColor::Gold,
+        vec![StatementBlock {
+            id: BlockId(1),
+            kind: StatementKind::RunCustomBlock {
+                custom_block_id: "tile-cycle".to_string(),
+                cached_name: "Cyclic Tile".to_string(),
+            },
+        }],
+    );
+    cyclic_tile.id = "tile-cycle".to_string();
+
+    let mut cycle_program = VisualProgram::new(TriggerBlock::LoopWhileActive);
+    cycle_program.append_root_block(StatementKind::RunCustomBlock {
+        custom_block_id: "tile-cycle".to_string(),
+        cached_name: "Cyclic Tile".to_string(),
+    });
+    let cycle_sink = Arc::new(MockInputSink::default());
+    let cycle_outcome = execute_visual_program_with_request(
+        VisualExecutionRequest {
+            program: &cycle_program,
+            custom_blocks: &[cyclic_tile],
+            input_sink: Arc::clone(&cycle_sink) as Arc<dyn InputSink>,
+            physical_input: Arc::new(MockPhysicalInput::default()),
+            abort_flag: &abort_flag,
+        },
+        &mut BlockExecutionHooks::default(),
+    );
+    assert!(cycle_outcome.is_err());
+    assert_eq!(
+        cycle_sink.snapshot_events(),
+        vec![RecordedEvent::ReleaseAll]
+    );
     Ok(())
 }

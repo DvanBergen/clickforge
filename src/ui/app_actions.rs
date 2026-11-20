@@ -1,13 +1,15 @@
-use std::collections::{HashSet, VecDeque};
+mod custom_blocks;
+mod history;
+
 use std::time::{Duration, Instant};
 
 use clickforge_sdk::KeyCode;
 use egui::{Key, Modifiers};
 
-use crate::engine::generate_rust_source_from_script;
+use crate::engine::generate_rust_source_with_custom_blocks;
 use crate::models::{
-    CoordinatorCommand, GameTargetRule, ScriptDocument, ScriptMode, TargetScope, VisualProgram,
-    inspect_script_validation,
+    CoordinatorCommand, GameTargetRule, ScriptDocument, ScriptMode, TargetScope,
+    inspect_script_validation_with_custom_blocks,
 };
 use crate::ui::active_dashboard::ActiveDashboardAction;
 use crate::ui::app::{ClickForgeWorkbenchApp, DeletedScriptUndoEntry, WorkbenchTab};
@@ -18,71 +20,9 @@ use crate::ui::script_settings_bar::SettingsBarAction;
 use crate::ui::sidebar::{NewScriptTemplateChoice, SidebarAction, script_mode_for_template};
 use crate::ui::target_picker_modal::TargetPickerAction;
 
+pub(crate) use history::VisualProgramHistory;
+
 const DELETE_UNDO_TOAST_DURATION_MS: u64 = 5_000;
-const MAX_UNDO_SNAPSHOTS_PER_SCRIPT: usize = 40;
-const MAX_TRACKED_HISTORY_SCRIPTS: usize = 64;
-const UNDO_COALESCE_WINDOW_MS: u64 = 450;
-
-/// Bounded per-script undo/redo snapshot stack for Visual Block editing.
-#[derive(Debug, Default)]
-pub(crate) struct VisualProgramHistory {
-    undo_stack: VecDeque<VisualProgram>,
-    redo_stack: VecDeque<VisualProgram>,
-    last_push_at: Option<Instant>,
-    last_block_count: usize,
-}
-
-impl VisualProgramHistory {
-    pub(crate) fn record_snapshot(
-        &mut self,
-        previous_program: VisualProgram,
-        current_block_count: usize,
-        is_pointer_down: bool,
-    ) {
-        let should_coalesce_drag = is_pointer_down
-            && self.last_block_count == current_block_count
-            && self.last_push_at.is_some_and(|pushed_at| {
-                pushed_at.elapsed() < Duration::from_millis(UNDO_COALESCE_WINDOW_MS)
-            });
-        if should_coalesce_drag {
-            return;
-        }
-        if self
-            .undo_stack
-            .back()
-            .is_some_and(|latest| *latest == previous_program)
-        {
-            return;
-        }
-        while self.undo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
-            self.undo_stack.pop_front();
-        }
-        self.undo_stack.push_back(previous_program);
-        self.redo_stack.clear();
-        self.last_push_at = Some(Instant::now());
-        self.last_block_count = current_block_count;
-    }
-
-    pub(crate) fn undo(&mut self, current_program: VisualProgram) -> Option<VisualProgram> {
-        let previous_program = self.undo_stack.pop_back()?;
-        while self.redo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
-            self.redo_stack.pop_front();
-        }
-        self.redo_stack.push_back(current_program);
-        self.last_push_at = None;
-        Some(previous_program)
-    }
-
-    pub(crate) fn redo(&mut self, current_program: VisualProgram) -> Option<VisualProgram> {
-        let next_program = self.redo_stack.pop_back()?;
-        while self.undo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
-            self.undo_stack.pop_front();
-        }
-        self.undo_stack.push_back(current_program);
-        self.last_push_at = None;
-        Some(next_program)
-    }
-}
 
 impl ClickForgeWorkbenchApp {
     pub(crate) fn process_keyboard_shortcuts(&mut self, egui_context: &egui::Context) {
@@ -97,7 +37,10 @@ impl ClickForgeWorkbenchApp {
             return;
         }
 
-        if self.target_picker_state.is_open || self.new_script_modal_state.is_open {
+        if self.target_picker_state.is_open
+            || self.new_script_modal_state.is_open
+            || self.custom_block_modal_state.is_open
+        {
             return;
         }
 
@@ -137,31 +80,6 @@ impl ClickForgeWorkbenchApp {
         if did_press_undo {
             self.undo_active_visual_edit();
         }
-    }
-
-    pub(crate) fn record_visual_program_undo_snapshot(
-        &mut self,
-        script_id: &str,
-        previous_program: VisualProgram,
-        current_block_count: usize,
-        is_pointer_down: bool,
-    ) {
-        if self.visual_history_by_script_id.len() >= MAX_TRACKED_HISTORY_SCRIPTS
-            && !self.visual_history_by_script_id.contains_key(script_id)
-        {
-            let active_ids: HashSet<&str> = self
-                .scripts
-                .iter()
-                .map(|script| script.id.as_str())
-                .collect();
-            self.visual_history_by_script_id
-                .retain(|tracked_id, _| active_ids.contains(tracked_id.as_str()));
-        }
-
-        self.visual_history_by_script_id
-            .entry(script_id.to_string())
-            .or_default()
-            .record_snapshot(previous_program, current_block_count, is_pointer_down);
     }
 
     pub(crate) fn apply_sidebar_actions(
@@ -283,14 +201,19 @@ impl ClickForgeWorkbenchApp {
     }
 
     pub(crate) fn disable_all_scripts(&mut self) {
+        let custom_blocks_snapshot = self.custom_blocks.clone();
         for script in &mut self.scripts {
             if !script.is_enabled {
                 continue;
             }
             script.is_enabled = false;
             script.touch_updated_timestamp();
-            if inspect_script_validation(script).is_valid()
-                && self.repository.save_script(script).is_ok()
+            if inspect_script_validation_with_custom_blocks(script, &custom_blocks_snapshot)
+                .is_valid()
+                && self
+                    .repository
+                    .save_script_with_custom_blocks(script, &custom_blocks_snapshot)
+                    .is_ok()
             {
                 self.dirty_script_ids.remove(&script.id);
             }
@@ -417,31 +340,47 @@ impl ClickForgeWorkbenchApp {
         if actions.is_empty() {
             return;
         }
-        let Some(active_index) = self.active_script_index() else {
-            return;
-        };
-        let script_id = self.scripts[active_index].id.clone();
-        let before_program = self.scripts[active_index].visual_program.clone();
-        let mut did_modify = false;
+        let active_index = self.active_script_index();
+        let before_snapshot = active_index.map(|index| {
+            (
+                self.scripts[index].id.clone(),
+                self.scripts[index].visual_program.clone(),
+            )
+        });
+        let mut did_modify_active_script = false;
 
         for action in actions {
             match action {
                 PaletteAction::ApplyTrigger(new_trigger) => {
-                    self.scripts[active_index].visual_program.trigger = new_trigger;
-                    did_modify = true;
+                    if let Some(index) = active_index {
+                        self.scripts[index].visual_program.trigger = new_trigger;
+                        did_modify_active_script = true;
+                    }
                 }
                 PaletteAction::AppendStatement(statement_kind) => {
-                    self.scripts[active_index]
-                        .visual_program
-                        .append_root_block(statement_kind);
-                    did_modify = true;
+                    if let Some(index) = active_index {
+                        self.scripts[index]
+                            .visual_program
+                            .append_root_block(statement_kind);
+                        did_modify_active_script = true;
+                    }
+                }
+                PaletteAction::OpenNewCustomBlockModal => {
+                    self.open_custom_block_modal_for_new();
+                }
+                PaletteAction::EditCustomBlock(custom_block_id) => {
+                    self.open_custom_block_modal_for_edit(&custom_block_id);
+                }
+                PaletteAction::DeleteCustomBlock(custom_block_id) => {
+                    self.delete_custom_block_by_id(&custom_block_id);
                 }
             }
         }
-        if did_modify {
-            let current_block_count = self.scripts[active_index]
-                .visual_program
-                .total_block_count();
+        if did_modify_active_script
+            && let Some(index) = active_index
+            && let Some((script_id, before_program)) = before_snapshot
+        {
+            let current_block_count = self.scripts[index].visual_program.total_block_count();
             self.record_visual_program_undo_snapshot(
                 &script_id,
                 before_program,
@@ -453,17 +392,42 @@ impl ClickForgeWorkbenchApp {
     }
 
     pub(crate) fn apply_canvas_actions(&mut self, actions: Vec<BlockCanvasAction>) {
-        let Some(active_index) = self.active_script_index() else {
-            return;
-        };
+        let active_index = self.active_script_index();
         for action in actions {
             match action {
                 BlockCanvasAction::MarkDirty => {
-                    let script_id = self.scripts[active_index].id.clone();
-                    self.mark_script_dirty(&script_id);
+                    if let Some(index) = active_index {
+                        let script_id = self.scripts[index].id.clone();
+                        self.mark_script_dirty(&script_id);
+                    }
                 }
                 BlockCanvasAction::ExportToRust => {
                     self.export_active_script_to_rust();
+                }
+                BlockCanvasAction::EditCustomBlock(custom_block_id) => {
+                    self.open_custom_block_modal_for_edit(&custom_block_id);
+                }
+                BlockCanvasAction::UnpackCustomBlock {
+                    tile_name,
+                    unpacked_block_count,
+                } => {
+                    let block_word = if unpacked_block_count == 1 {
+                        "block"
+                    } else {
+                        "blocks"
+                    };
+                    self.show_toast(
+                        format!(
+                            "Unpacked '{tile_name}' inline ({unpacked_block_count} {block_word})."
+                        ),
+                        false,
+                    );
+                }
+                BlockCanvasAction::SaveBlockAsCustomTile {
+                    suggested_name,
+                    statements,
+                } => {
+                    self.open_custom_block_modal_for_statements(suggested_name, statements);
                 }
             }
         }
@@ -481,7 +445,10 @@ impl ClickForgeWorkbenchApp {
                 }
                 RustEditorAction::CompileActiveScript => {
                     let script_snapshot = self.scripts[active_index].clone();
-                    let validation_report = inspect_script_validation(&script_snapshot);
+                    let validation_report = inspect_script_validation_with_custom_blocks(
+                        &script_snapshot,
+                        &self.custom_blocks,
+                    );
                     if !validation_report.is_valid() {
                         self.show_toast(
                             "Compilation blocked until validation issues are resolved.",
@@ -508,7 +475,10 @@ impl ClickForgeWorkbenchApp {
         self.scripts[active_index].touch_updated_timestamp();
         let script_snapshot = self.scripts[active_index].clone();
 
-        match self.repository.save_script(&script_snapshot) {
+        match self
+            .repository
+            .save_script_with_custom_blocks(&script_snapshot, &self.custom_blocks)
+        {
             Ok(_) => {
                 self.dirty_script_ids.remove(&script_snapshot.id);
                 let _ = self
@@ -522,42 +492,6 @@ impl ClickForgeWorkbenchApp {
         }
     }
 
-    pub(crate) fn undo_active_visual_edit(&mut self) {
-        let Some(active_index) = self.active_script_index() else {
-            return;
-        };
-        let script_id = self.scripts[active_index].id.clone();
-        let current_program = self.scripts[active_index].visual_program.clone();
-        let Some(restored_program) = self
-            .visual_history_by_script_id
-            .get_mut(&script_id)
-            .and_then(|history| history.undo(current_program))
-        else {
-            return;
-        };
-        self.scripts[active_index].visual_program = restored_program;
-        self.mark_script_dirty(&script_id);
-        self.show_toast("Undid visual block edit.", false);
-    }
-
-    pub(crate) fn redo_active_visual_edit(&mut self) {
-        let Some(active_index) = self.active_script_index() else {
-            return;
-        };
-        let script_id = self.scripts[active_index].id.clone();
-        let current_program = self.scripts[active_index].visual_program.clone();
-        let Some(restored_program) = self
-            .visual_history_by_script_id
-            .get_mut(&script_id)
-            .and_then(|history| history.redo(current_program))
-        else {
-            return;
-        };
-        self.scripts[active_index].visual_program = restored_program;
-        self.mark_script_dirty(&script_id);
-        self.show_toast("Redid visual block edit.", false);
-    }
-
     pub(crate) fn restore_last_deleted_script(&mut self) {
         let Some(deleted_entry) = self.last_deleted_script.take() else {
             return;
@@ -567,7 +501,11 @@ impl ClickForgeWorkbenchApp {
         let restored_name = restored_script.name.clone();
         let insert_index = deleted_entry.original_index.min(self.scripts.len());
 
-        if self.repository.save_script(&restored_script).is_ok() {
+        if self
+            .repository
+            .save_script_with_custom_blocks(&restored_script, &self.custom_blocks)
+            .is_ok()
+        {
             let _ = self
                 .coordinator
                 .send_command(CoordinatorCommand::UpsertScript(restored_script.clone()));
@@ -586,7 +524,10 @@ impl ClickForgeWorkbenchApp {
         let Some(active_index) = self.active_script_index() else {
             return;
         };
-        let generated_rust = generate_rust_source_from_script(&self.scripts[active_index]);
+        let generated_rust = generate_rust_source_with_custom_blocks(
+            &self.scripts[active_index],
+            &self.custom_blocks,
+        );
         self.scripts[active_index].rust_source = generated_rust;
         self.scripts[active_index].mode = ScriptMode::AdvancedRust;
         let script_id = self.scripts[active_index].id.clone();
@@ -602,7 +543,10 @@ impl ClickForgeWorkbenchApp {
             return;
         };
         if is_enabled {
-            let validation_report = inspect_script_validation(&self.scripts[script_index]);
+            let validation_report = inspect_script_validation_with_custom_blocks(
+                &self.scripts[script_index],
+                &self.custom_blocks,
+            );
             if !validation_report.is_valid() {
                 let first_reason = validation_report
                     .issues
@@ -618,7 +562,11 @@ impl ClickForgeWorkbenchApp {
         self.scripts[script_index].touch_updated_timestamp();
         let updated_script = self.scripts[script_index].clone();
 
-        if self.repository.save_script(&updated_script).is_ok() {
+        if self
+            .repository
+            .save_script_with_custom_blocks(&updated_script, &self.custom_blocks)
+            .is_ok()
+        {
             self.dirty_script_ids.remove(&updated_script.id);
         }
         let _ = self
@@ -669,9 +617,16 @@ impl ClickForgeWorkbenchApp {
 
         let new_script_id = new_script.id.clone();
         let new_script_name = new_script.name.clone();
-        let can_persist_now = inspect_script_validation(&new_script).is_valid();
+        let can_persist_now =
+            inspect_script_validation_with_custom_blocks(&new_script, &self.custom_blocks)
+                .is_valid();
 
-        if can_persist_now && self.repository.save_script(&new_script).is_ok() {
+        if can_persist_now
+            && self
+                .repository
+                .save_script_with_custom_blocks(&new_script, &self.custom_blocks)
+                .is_ok()
+        {
             let _ = self
                 .coordinator
                 .send_command(CoordinatorCommand::UpsertScript(new_script.clone()));
@@ -690,11 +645,19 @@ impl ClickForgeWorkbenchApp {
     fn sync_target_change_for_active_script(&mut self, active_index: usize, toast_message: String) {
         let script_id = self.scripts[active_index].id.clone();
         if self.active_tab == WorkbenchTab::Active
-            && inspect_script_validation(&self.scripts[active_index]).is_valid()
+            && inspect_script_validation_with_custom_blocks(
+                &self.scripts[active_index],
+                &self.custom_blocks,
+            )
+            .is_valid()
         {
             self.scripts[active_index].touch_updated_timestamp();
             let updated_script = self.scripts[active_index].clone();
-            if self.repository.save_script(&updated_script).is_ok() {
+            if self
+                .repository
+                .save_script_with_custom_blocks(&updated_script, &self.custom_blocks)
+                .is_ok()
+            {
                 self.dirty_script_ids.remove(&script_id);
             } else {
                 self.mark_script_dirty(&script_id);
@@ -724,7 +687,11 @@ impl ClickForgeWorkbenchApp {
         duplicated_script.touch_updated_timestamp();
         let new_script_id = duplicated_script.id.clone();
 
-        if self.repository.save_script(&duplicated_script).is_ok() {
+        if self
+            .repository
+            .save_script_with_custom_blocks(&duplicated_script, &self.custom_blocks)
+            .is_ok()
+        {
             let _ = self
                 .coordinator
                 .send_command(CoordinatorCommand::UpsertScript(duplicated_script.clone()));

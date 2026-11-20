@@ -1,24 +1,31 @@
-mod templates;
+mod custom_tiles;
+pub(crate) mod templates;
+mod trash_zone;
 
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Margin, Painter, PointerButton,
-    Popup, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui,
-    epaint::PathShape, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, PointerButton, Popup, Pos2, Rect,
+    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, epaint::PathShape, pos2, vec2,
 };
 
-use crate::models::{BlockCategory, BlockId, BlockSlotTarget, StatementKind, TriggerBlock};
+use crate::models::{
+    BlockCategory, BlockId, BlockSlotTarget, CustomBlockColor, CustomBlockDefinition,
+    StatementKind, TriggerBlock,
+};
 use crate::ui::block_node_renderer::{
     MINI_BLOCK_GEOMETRY, build_leaf_block_shapes, build_trigger_hat_shapes,
 };
 use crate::ui::theme::{
-    ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BORDER_STRONG, BORDER_SUBTLE, CORNER_RADIUS_MD_PX,
-    CORNER_RADIUS_PILL_PX, CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX,
-    STATUS_DANGER_INK, STATUS_DANGER_SOLID, STATUS_DANGER_TINT, SURFACE_ELEVATED, SURFACE_HOVER,
-    TEXT_MUTED, TEXT_PRIMARY, block_visual_colors, category_color, font_family_semibold,
-    rich_semibold,
+    ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BORDER_STRONG, BORDER_SUBTLE, CORNER_RADIUS_PILL_PX,
+    CORNER_RADIUS_SM_PX, FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX, SURFACE_ELEVATED, SURFACE_HOVER,
+    TEXT_MUTED, TEXT_PRIMARY, block_visual_colors, category_color, custom_block_swatch_color,
+    font_family_mono_bold, font_family_semibold, rich_semibold,
 };
 
+use custom_tiles::render_custom_tiles_section;
 use templates::{PALETTE_TEMPLATES, PaletteTemplateSpec, build_template_action_and_payload};
+use trash_zone::{
+    paint_palette_trash_hint_banner, paint_palette_trash_overlay, render_empty_filter_state,
+};
 
 /// Default palette dock width in logical pixels.
 pub const PALETTE_DEFAULT_WIDTH_PX: f32 = 236.0;
@@ -33,11 +40,9 @@ const PALETTE_DROP_SNAP_TOLERANCE_Y_PX: f32 = 32.0;
 const PALETTE_DROP_MARGIN_X_PX: f32 = 28.0;
 const NESTED_SLOT_PREFERENCE_WINDOW_PX: f32 = 16.0;
 const STRICT_X_PREFERENCE_WINDOW_PX: f32 = 18.0;
-const MINI_BLOCK_HEIGHT_PX: f32 = 30.0;
+pub(super) const MINI_BLOCK_HEIGHT_PX: f32 = 30.0;
 const MINI_HAT_HEIGHT_PX: f32 = 34.0;
-const CATEGORY_DOT_RADIUS_PX: f32 = 3.5;
-const TRASH_OVERLAY_ALPHA: u8 = 228;
-const TRASH_BANNER_HEIGHT_PX: f32 = 30.0;
+pub(super) const CATEGORY_DOT_RADIUS_PX: f32 = 3.5;
 
 /// Filter selection for narrowing the visible block templates inside the palette.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +54,7 @@ pub enum PaletteCategoryFilter {
     Actions,
     Timing,
     Variables,
+    Custom,
 }
 
 impl PaletteCategoryFilter {
@@ -60,6 +66,7 @@ impl PaletteCategoryFilter {
             Self::Actions => "Actions",
             Self::Timing => "Timing",
             Self::Variables => "Vars",
+            Self::Custom => "My Blocks",
         }
     }
 
@@ -71,6 +78,7 @@ impl PaletteCategoryFilter {
             Self::Actions => Some(BlockCategory::Action),
             Self::Timing => Some(BlockCategory::Timing),
             Self::Variables => Some(BlockCategory::Variable),
+            Self::Custom => Some(BlockCategory::Custom),
         }
     }
 
@@ -100,6 +108,7 @@ pub struct ActiveBlockDrag {
     pub preview_summary: String,
     pub category: BlockCategory,
     pub accent_color: Color32,
+    pub custom_color: Option<CustomBlockColor>,
 }
 
 /// Closest valid drop slot computed during a canvas layout frame.
@@ -152,6 +161,25 @@ impl BlockDragState {
             preview_summary: preview_summary.into(),
             category,
             accent_color: category_color(category),
+            custom_color: None,
+        });
+    }
+
+    /// Starts dragging a reusable custom tile block tinted with its chosen `CustomBlockColor`.
+    pub fn start_custom_tile_drag(
+        &mut self,
+        payload: BlockDragPayload,
+        preview_label: impl Into<String>,
+        preview_summary: impl Into<String>,
+        custom_color: CustomBlockColor,
+    ) {
+        self.active_drag = Some(ActiveBlockDrag {
+            payload,
+            preview_label: preview_label.into(),
+            preview_summary: preview_summary.into(),
+            category: BlockCategory::Custom,
+            accent_color: custom_block_swatch_color(custom_color),
+            custom_color: Some(custom_color),
         });
     }
 
@@ -242,16 +270,20 @@ fn should_prefer_slot_candidate(existing: HoveredDropSlot, candidate: HoveredDro
     candidate.distance_y_px < existing.distance_y_px
 }
 
-/// Immediate click-to-insert actions emitted by the block palette.
+/// Immediate click-to-insert and custom-tile management actions emitted by the block palette.
 #[derive(Debug, Clone)]
 pub enum PaletteAction {
     ApplyTrigger(TriggerBlock),
     AppendStatement(StatementKind),
+    OpenNewCustomBlockModal,
+    EditCustomBlock(String),
+    DeleteCustomBlock(String),
 }
 
 /// Renders the filtered Scratch-style mini-block palette with click-to-add, drag-to-place, and trash drop.
 pub fn render_block_palette(
     ui: &mut Ui,
+    custom_blocks: &[CustomBlockDefinition],
     drag_state: &mut BlockDragState,
     emitted_actions: &mut Vec<PaletteAction>,
 ) {
@@ -277,7 +309,11 @@ pub fn render_block_palette(
 
     render_palette_search_bar(ui, &mut drag_state.palette_search_query);
     ui.add_space(5.0);
-    render_category_filter_strip(ui, &mut drag_state.selected_category_filter);
+    render_category_filter_strip(
+        ui,
+        &mut drag_state.selected_category_filter,
+        custom_blocks.len(),
+    );
     ui.add_space(8.0);
 
     let normalized_query = drag_state.palette_search_query.trim().to_ascii_lowercase();
@@ -295,6 +331,16 @@ pub fn render_block_palette(
         .id_salt("block_palette_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            if active_filter == PaletteCategoryFilter::Custom {
+                rendered_any_item |= render_custom_tiles_section(
+                    ui,
+                    custom_blocks,
+                    &normalized_query,
+                    true,
+                    drag_state,
+                    emitted_actions,
+                );
+            }
             for (section_title, category) in sections {
                 if !active_filter.matches_category(category) {
                     continue;
@@ -304,6 +350,16 @@ pub fn render_block_palette(
                     section_title,
                     category,
                     &normalized_query,
+                    drag_state,
+                    emitted_actions,
+                );
+            }
+            if active_filter == PaletteCategoryFilter::All {
+                rendered_any_item |= render_custom_tiles_section(
+                    ui,
+                    custom_blocks,
+                    &normalized_query,
+                    false,
                     drag_state,
                     emitted_actions,
                 );
@@ -346,7 +402,11 @@ fn render_palette_search_bar(ui: &mut Ui, search_query: &mut String) {
     });
 }
 
-fn render_category_filter_strip(ui: &mut Ui, active_filter: &mut PaletteCategoryFilter) {
+fn render_category_filter_strip(
+    ui: &mut Ui,
+    active_filter: &mut PaletteCategoryFilter,
+    custom_tile_count: usize,
+) {
     const FILTER_ROWS: [[PaletteCategoryFilter; 3]; 2] = [
         [
             PaletteCategoryFilter::All,
@@ -360,7 +420,8 @@ fn render_category_filter_strip(ui: &mut Ui, active_filter: &mut PaletteCategory
         ],
     ];
     let pill_gap_px = 4.0;
-    let pill_width_px = ((ui.available_width() - (pill_gap_px * 2.0)) / 3.0).max(56.0);
+    let full_width_px = ui.available_width();
+    let pill_width_px = ((full_width_px - (pill_gap_px * 2.0)) / 3.0).max(56.0);
 
     for (row_index, row_filters) in FILTER_ROWS.iter().enumerate() {
         if row_index > 0 {
@@ -369,40 +430,77 @@ fn render_category_filter_strip(ui: &mut Ui, active_filter: &mut PaletteCategory
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = pill_gap_px;
             for candidate_filter in row_filters {
-                let is_selected = *active_filter == *candidate_filter;
-                let (pill_rect, response) =
-                    ui.allocate_exact_size(vec2(pill_width_px, 24.0), Sense::click());
-                let (fill_color, border_color, text_color) = if is_selected {
-                    (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, TEXT_PRIMARY)
-                } else if response.hovered() {
-                    (SURFACE_HOVER, BORDER_STRONG, TEXT_MUTED)
-                } else {
-                    (SURFACE_ELEVATED, BORDER_SUBTLE, TEXT_MUTED)
-                };
-                ui.painter().rect(
-                    pill_rect,
-                    CornerRadius::same(CORNER_RADIUS_PILL_PX),
-                    fill_color,
-                    Stroke::new(1.0, border_color),
-                    StrokeKind::Inside,
+                render_category_filter_pill(
+                    ui,
+                    *candidate_filter,
+                    active_filter,
+                    pill_width_px,
+                    None,
                 );
-                ui.painter().circle_filled(
-                    pos2(pill_rect.min.x + 10.0, pill_rect.center().y),
-                    CATEGORY_DOT_RADIUS_PX,
-                    candidate_filter.dot_color(),
-                );
-                ui.painter().text(
-                    pos2(pill_rect.min.x + 18.0, pill_rect.center().y),
-                    Align2::LEFT_CENTER,
-                    candidate_filter.display_label(),
-                    FontId::new(11.5, font_family_semibold()),
-                    text_color,
-                );
-                if response.clicked() {
-                    *active_filter = *candidate_filter;
-                }
             }
         });
+    }
+
+    ui.add_space(4.0);
+    render_category_filter_pill(
+        ui,
+        PaletteCategoryFilter::Custom,
+        active_filter,
+        full_width_px.max(120.0),
+        Some(custom_tile_count),
+    );
+}
+
+fn render_category_filter_pill(
+    ui: &mut Ui,
+    candidate_filter: PaletteCategoryFilter,
+    active_filter: &mut PaletteCategoryFilter,
+    pill_width_px: f32,
+    trailing_count: Option<usize>,
+) {
+    let is_selected = *active_filter == candidate_filter;
+    let (pill_rect, response) = ui.allocate_exact_size(vec2(pill_width_px, 24.0), Sense::click());
+    let (fill_color, border_color, text_color) = if is_selected {
+        (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, TEXT_PRIMARY)
+    } else if response.hovered() {
+        (SURFACE_HOVER, BORDER_STRONG, TEXT_MUTED)
+    } else {
+        (SURFACE_ELEVATED, BORDER_SUBTLE, TEXT_MUTED)
+    };
+    ui.painter().rect(
+        pill_rect,
+        CornerRadius::same(CORNER_RADIUS_PILL_PX),
+        fill_color,
+        Stroke::new(1.0, border_color),
+        StrokeKind::Inside,
+    );
+    ui.painter().circle_filled(
+        pos2(pill_rect.min.x + 10.0, pill_rect.center().y),
+        CATEGORY_DOT_RADIUS_PX,
+        candidate_filter.dot_color(),
+    );
+    ui.painter().text(
+        pos2(pill_rect.min.x + 18.0, pill_rect.center().y),
+        Align2::LEFT_CENTER,
+        candidate_filter.display_label(),
+        FontId::new(11.5, font_family_semibold()),
+        text_color,
+    );
+    if let Some(count_value) = trailing_count {
+        ui.painter().text(
+            pos2(pill_rect.max.x - 10.0, pill_rect.center().y),
+            Align2::RIGHT_CENTER,
+            count_value.to_string(),
+            FontId::new(11.0, font_family_mono_bold()),
+            if is_selected {
+                ACCENT_PRIMARY
+            } else {
+                TEXT_MUTED
+            },
+        );
+    }
+    if response.clicked() {
+        *active_filter = candidate_filter;
     }
 }
 
@@ -448,7 +546,7 @@ fn render_palette_section(
     true
 }
 
-fn matches_search_query(
+pub(super) fn matches_search_query(
     normalized_query: &str,
     section_title: &str,
     title: &str,
@@ -574,124 +672,4 @@ fn render_palette_mini_block(
         emitted_actions.push(palette_action);
     }
     ui.add_space(4.0);
-}
-
-fn render_empty_filter_state(ui: &mut Ui, drag_state: &mut BlockDragState) {
-    ui.add_space(12.0);
-    Frame::NONE
-        .fill(SURFACE_ELEVATED)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_MD_PX))
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.label(rich_semibold(
-                    "No matching blocks",
-                    FONT_SIZE_SMALL_PX,
-                    TEXT_PRIMARY,
-                ));
-                ui.add_space(6.0);
-                let reset_button = egui::Button::new(rich_semibold(
-                    "Reset Filters",
-                    FONT_SIZE_SMALL_PX,
-                    TEXT_PRIMARY,
-                ))
-                .fill(SURFACE_HOVER)
-                .stroke(Stroke::new(1.0, BORDER_STRONG))
-                .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX));
-                if ui.add(reset_button).clicked() {
-                    drag_state.palette_search_query.clear();
-                    drag_state.selected_category_filter = PaletteCategoryFilter::All;
-                }
-            });
-        });
-}
-
-fn paint_palette_trash_overlay(ui: &Ui, palette_rect: Rect) {
-    let painter = ui.painter_at(palette_rect);
-    let overlay_fill = Color32::from_rgba_unmultiplied(
-        STATUS_DANGER_TINT.r(),
-        STATUS_DANGER_TINT.g(),
-        STATUS_DANGER_TINT.b(),
-        TRASH_OVERLAY_ALPHA,
-    );
-    painter.rect(
-        palette_rect,
-        CornerRadius::same(CORNER_RADIUS_MD_PX),
-        overlay_fill,
-        Stroke::new(2.0, STATUS_DANGER_SOLID),
-        StrokeKind::Inside,
-    );
-    let center = palette_rect.center();
-    paint_trash_bin_icon(&painter, pos2(center.x, center.y - 26.0), STATUS_DANGER_INK);
-    painter.text(
-        pos2(center.x, center.y + 8.0),
-        Align2::CENTER_CENTER,
-        "Drop here to delete block",
-        FontId::new(FONT_SIZE_BODY_PX, font_family_semibold()),
-        TEXT_PRIMARY,
-    );
-    painter.text(
-        pos2(center.x, center.y + 28.0),
-        Align2::CENTER_CENTER,
-        "Release mouse to remove",
-        FontId::new(FONT_SIZE_SMALL_PX, egui::FontFamily::Proportional),
-        STATUS_DANGER_INK,
-    );
-}
-
-fn paint_palette_trash_hint_banner(ui: &Ui, palette_rect: Rect) {
-    let banner_rect = Rect::from_min_max(
-        pos2(
-            palette_rect.min.x + 2.0,
-            palette_rect.max.y - TRASH_BANNER_HEIGHT_PX - 2.0,
-        ),
-        pos2(palette_rect.max.x - 2.0, palette_rect.max.y - 2.0),
-    );
-    let painter = ui.painter_at(palette_rect);
-    painter.rect(
-        banner_rect,
-        CornerRadius::same(CORNER_RADIUS_SM_PX),
-        STATUS_DANGER_TINT,
-        Stroke::new(1.0, STATUS_DANGER_SOLID),
-        StrokeKind::Inside,
-    );
-    painter.text(
-        banner_rect.center(),
-        Align2::CENTER_CENTER,
-        "Drag block here to delete",
-        FontId::new(FONT_SIZE_SMALL_PX, font_family_semibold()),
-        STATUS_DANGER_INK,
-    );
-}
-
-fn paint_trash_bin_icon(painter: &Painter, center: Pos2, icon_color: Color32) {
-    let stroke = Stroke::new(1.8, icon_color);
-    let lid_bar = [
-        pos2(center.x - 12.0, center.y - 8.0),
-        pos2(center.x + 12.0, center.y - 8.0),
-    ];
-    painter.line_segment(lid_bar, stroke);
-    let handle = vec![
-        pos2(center.x - 4.0, center.y - 8.0),
-        pos2(center.x - 4.0, center.y - 12.0),
-        pos2(center.x + 4.0, center.y - 12.0),
-        pos2(center.x + 4.0, center.y - 8.0),
-    ];
-    let body = vec![
-        pos2(center.x - 9.0, center.y - 8.0),
-        pos2(center.x - 7.0, center.y + 12.0),
-        pos2(center.x + 7.0, center.y + 12.0),
-        pos2(center.x + 9.0, center.y - 8.0),
-    ];
-    painter.add(Shape::Path(PathShape::line(handle, stroke)));
-    painter.add(Shape::Path(PathShape::line(body, stroke)));
-    for rib_offset_x_px in [-3.0_f32, 0.0, 3.0] {
-        let rib = [
-            pos2(center.x + rib_offset_x_px, center.y - 3.5),
-            pos2(center.x + rib_offset_x_px, center.y + 7.5),
-        ];
-        painter.line_segment(rib, Stroke::new(1.3, icon_color));
-    }
 }

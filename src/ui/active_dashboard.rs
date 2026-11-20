@@ -9,7 +9,8 @@ use egui::{
 };
 
 use crate::models::{
-    ActiveWindowSnapshot, CoordinatorSnapshot, InputSubsystemStatus, ScriptDocument,
+    ActiveWindowSnapshot, CoordinatorSnapshot, CustomBlockDefinition, InputSubsystemStatus,
+    ScriptDocument,
 };
 use crate::ui::theme::{
     ACCENT_PRIMARY, BORDER_STRONG, BORDER_SUBTLE, CORNER_RADIUS_MD_PX, CORNER_RADIUS_SM_PX,
@@ -55,6 +56,7 @@ pub enum ActiveDashboardAction {
 /// Read-only projection passed into `render_active_dashboard`.
 pub struct ActiveDashboardViewModel<'frame> {
     pub scripts: &'frame [ScriptDocument],
+    pub custom_blocks: &'frame [CustomBlockDefinition],
     pub selected_script_id: Option<&'frame str>,
     pub dirty_script_ids: &'frame HashSet<String>,
     pub snapshot: &'frame CoordinatorSnapshot,

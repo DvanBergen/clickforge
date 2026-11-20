@@ -1,28 +1,41 @@
+mod plan;
+
 use clickforge_sdk::InputTrigger;
 
+use crate::engine::rust_codegen::plan::{
+    CustomCodegenPlan, ProgramFeatureFlags, ResolvedCustomTile, inspect_program_features,
+    slice_contains_wait_action, slice_ends_with_terminator,
+};
 use crate::models::{
-    ComparisonOperator, ConditionExpr, ScriptDocument, StatementBlock, StatementKind, TriggerBlock,
-    VisualProgram,
+    ComparisonOperator, ConditionExpr, CustomBlockDefinition, ScriptDocument, StatementBlock,
+    StatementKind, TriggerBlock, VisualProgram,
 };
 
 const IDLE_POLL_DELAY_MS: u64 = 4;
+const HOLD_POLL_DELAY_MS: u64 = 2;
 const ANTI_SPIN_YIELD_DELAY_MS: u64 = 1;
 const INDENT_WIDTH_SPACES: usize = 4;
 
-#[derive(Default)]
-struct ProgramFeatureFlags {
-    uses_mouse_button: bool,
-    uses_key_code: bool,
-    uses_gaussian_range: bool,
-    uses_variables: bool,
-    mutates_variables: bool,
-    uses_random_chance: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariableBindingMode {
+    Owned,
+    MutRef,
+    SharedRef,
 }
 
 /// Translates any Visual Block script into compiling native Rust using `clickforge_sdk`.
 pub fn generate_rust_source_from_script(script: &ScriptDocument) -> String {
+    generate_rust_source_with_custom_blocks(script, &[])
+}
+
+/// Translates a Visual Block script and its referenced custom tiles into compiling native Rust.
+pub fn generate_rust_source_with_custom_blocks(
+    script: &ScriptDocument,
+    custom_blocks: &[CustomBlockDefinition],
+) -> String {
     let program = &script.visual_program;
-    let feature_flags = inspect_program_features(program);
+    let custom_plan = CustomCodegenPlan::build(program, custom_blocks);
+    let feature_flags = inspect_program_features(program, &custom_plan);
     let mut output_lines = Vec::new();
 
     emit_imports(&feature_flags, &mut output_lines);
@@ -42,15 +55,61 @@ pub fn generate_rust_source_from_script(script: &ScriptDocument) -> String {
             "let"
         };
         output_lines.push(format!(
-            "    {mutability_keyword} script_variables: HashMap<&str, f64> = HashMap::new();"
+            "    {mutability_keyword} script_variables: HashMap<&'static str, f64> = HashMap::new();"
         ));
     }
 
-    emit_trigger_body(program, &mut output_lines);
+    emit_trigger_body(program, &custom_plan, &mut output_lines);
 
     output_lines.push("    Ok(())".to_string());
     output_lines.push("}".to_string());
+
+    for resolved_tile in &custom_plan.ordered_tiles {
+        output_lines.push(String::new());
+        emit_custom_tile_helper(resolved_tile, &custom_plan, &mut output_lines);
+    }
+
     output_lines.join("\n")
+}
+
+fn emit_custom_tile_helper(
+    resolved_tile: &ResolvedCustomTile<'_>,
+    custom_plan: &CustomCodegenPlan<'_>,
+    output_lines: &mut Vec<String>,
+) {
+    let (parameter_suffix, binding_mode) = if resolved_tile.mutates_variables {
+        (
+            ", script_variables: &mut HashMap<&'static str, f64>",
+            VariableBindingMode::MutRef,
+        )
+    } else if resolved_tile.uses_variables {
+        (
+            ", script_variables: &HashMap<&'static str, f64>",
+            VariableBindingMode::SharedRef,
+        )
+    } else {
+        ("", VariableBindingMode::Owned)
+    };
+
+    output_lines.push(format!(
+        "// Custom tile: {}",
+        sanitize_single_line_comment(&resolved_tile.definition.name)
+    ));
+    output_lines.push(format!(
+        "fn {}(script_context: &mut ScriptContext{parameter_suffix}) -> ScriptResult<()> {{",
+        resolved_tile.function_name
+    ));
+    emit_statement_slice(
+        &resolved_tile.definition.statements,
+        1,
+        custom_plan,
+        binding_mode,
+        output_lines,
+    );
+    if !slice_ends_with_terminator(&resolved_tile.definition.statements) {
+        output_lines.push("    Ok(())".to_string());
+    }
+    output_lines.push("}".to_string());
 }
 
 fn emit_imports(feature_flags: &ProgramFeatureFlags, output_lines: &mut Vec<String>) {
@@ -78,8 +137,12 @@ fn emit_imports(feature_flags: &ProgramFeatureFlags, output_lines: &mut Vec<Stri
     }
 }
 
-fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
-    let body_has_wait = slice_contains_wait_action(&program.statements);
+fn emit_trigger_body(
+    program: &VisualProgram,
+    custom_plan: &CustomCodegenPlan<'_>,
+    output_lines: &mut Vec<String>,
+) {
+    let body_has_wait = slice_contains_wait_action(&program.statements, custom_plan, 0);
 
     match &program.trigger {
         TriggerBlock::WhileInputHeld {
@@ -89,7 +152,13 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
             let input_expr = format_chord_pressed_expr(*trigger_input, additional_held_inputs);
             output_lines.push("    while !script_context.should_stop() {".to_string());
             output_lines.push(format!("        if {input_expr} {{"));
-            emit_statement_slice(&program.statements, 3, output_lines);
+            emit_statement_slice(
+                &program.statements,
+                3,
+                custom_plan,
+                VariableBindingMode::Owned,
+                output_lines,
+            );
             if !body_has_wait {
                 output_lines.push(format!(
                     "{}script_context.wait_fixed_ms({ANTI_SPIN_YIELD_DELAY_MS})?;",
@@ -118,7 +187,13 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
             output_lines.push("        }".to_string());
             output_lines.push("        was_trigger_pressed = is_trigger_pressed;".to_string());
             output_lines.push("        if is_toggle_active {".to_string());
-            emit_statement_slice(&program.statements, 3, output_lines);
+            emit_statement_slice(
+                &program.statements,
+                3,
+                custom_plan,
+                VariableBindingMode::Owned,
+                output_lines,
+            );
             if !body_has_wait {
                 output_lines.push(format!(
                     "{}script_context.wait_fixed_ms({ANTI_SPIN_YIELD_DELAY_MS})?;",
@@ -143,7 +218,13 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
             output_lines
                 .push("        if is_trigger_pressed && !was_trigger_pressed {".to_string());
             output_lines.push("            was_trigger_pressed = true;".to_string());
-            emit_statement_slice(&program.statements, 3, output_lines);
+            emit_statement_slice(
+                &program.statements,
+                3,
+                custom_plan,
+                VariableBindingMode::Owned,
+                output_lines,
+            );
             output_lines.push("        } else {".to_string());
             output_lines.push("            was_trigger_pressed = is_trigger_pressed;".to_string());
             output_lines.push(format!(
@@ -154,7 +235,13 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
         }
         TriggerBlock::LoopWhileActive => {
             output_lines.push("    while !script_context.should_stop() {".to_string());
-            emit_statement_slice(&program.statements, 2, output_lines);
+            emit_statement_slice(
+                &program.statements,
+                2,
+                custom_plan,
+                VariableBindingMode::Owned,
+                output_lines,
+            );
             if !body_has_wait && !slice_ends_with_terminator(&program.statements) {
                 output_lines.push(format!(
                     "{}script_context.wait_fixed_ms({ANTI_SPIN_YIELD_DELAY_MS})?;",
@@ -169,16 +256,26 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
 fn emit_statement_slice(
     statements: &[StatementBlock],
     indent_level: usize,
+    custom_plan: &CustomCodegenPlan<'_>,
+    binding_mode: VariableBindingMode,
     output_lines: &mut Vec<String>,
 ) {
     for block in statements {
-        emit_single_statement(&block.kind, indent_level, output_lines);
+        emit_single_statement(
+            &block.kind,
+            indent_level,
+            custom_plan,
+            binding_mode,
+            output_lines,
+        );
     }
 }
 
 fn emit_single_statement(
     kind: &StatementKind,
     indent_level: usize,
+    custom_plan: &CustomCodegenPlan<'_>,
+    binding_mode: VariableBindingMode,
     output_lines: &mut Vec<String>,
 ) {
     let prefix = indent_prefix(indent_level);
@@ -189,7 +286,13 @@ fn emit_single_statement(
         } => {
             let condition_code = format_condition_expr(condition);
             output_lines.push(format!("{prefix}if {condition_code} {{"));
-            emit_statement_slice(then_blocks, indent_level.saturating_add(1), output_lines);
+            emit_statement_slice(
+                then_blocks,
+                indent_level.saturating_add(1),
+                custom_plan,
+                binding_mode,
+                output_lines,
+            );
             output_lines.push(format!("{prefix}}}"));
         }
         StatementKind::IfThenElse {
@@ -199,9 +302,21 @@ fn emit_single_statement(
         } => {
             let condition_code = format_condition_expr(condition);
             output_lines.push(format!("{prefix}if {condition_code} {{"));
-            emit_statement_slice(then_blocks, indent_level.saturating_add(1), output_lines);
+            emit_statement_slice(
+                then_blocks,
+                indent_level.saturating_add(1),
+                custom_plan,
+                binding_mode,
+                output_lines,
+            );
             output_lines.push(format!("{prefix}}} else {{"));
-            emit_statement_slice(else_blocks, indent_level.saturating_add(1), output_lines);
+            emit_statement_slice(
+                else_blocks,
+                indent_level.saturating_add(1),
+                custom_plan,
+                binding_mode,
+                output_lines,
+            );
             output_lines.push(format!("{prefix}}}"));
         }
         StatementKind::WhileCondition {
@@ -212,8 +327,16 @@ fn emit_single_statement(
             output_lines.push(format!(
                 "{prefix}while !script_context.should_stop() && ({condition_code}) {{"
             ));
-            emit_statement_slice(body_blocks, indent_level.saturating_add(1), output_lines);
-            if !slice_contains_wait_action(body_blocks) && !slice_ends_with_terminator(body_blocks) {
+            emit_statement_slice(
+                body_blocks,
+                indent_level.saturating_add(1),
+                custom_plan,
+                binding_mode,
+                output_lines,
+            );
+            if !slice_contains_wait_action(body_blocks, custom_plan, 0)
+                && !slice_ends_with_terminator(body_blocks)
+            {
                 output_lines.push(format!(
                     "{}script_context.wait_fixed_ms({ANTI_SPIN_YIELD_DELAY_MS})?;",
                     indent_prefix(indent_level.saturating_add(1))
@@ -235,7 +358,13 @@ fn emit_single_statement(
                 indent_prefix(indent_level.saturating_add(2))
             ));
             output_lines.push(format!("{inner_prefix}}}"));
-            emit_statement_slice(body_blocks, indent_level.saturating_add(1), output_lines);
+            emit_statement_slice(
+                body_blocks,
+                indent_level.saturating_add(1),
+                custom_plan,
+                binding_mode,
+                output_lines,
+            );
             output_lines.push(format!("{prefix}}}"));
         }
         StatementKind::BreakLoop => output_lines.push(format!("{prefix}break;")),
@@ -255,6 +384,29 @@ fn emit_single_statement(
         StatementKind::MouseUp { mouse_button } => output_lines.push(format!(
             "{prefix}script_context.mouse_up(MouseButton::{mouse_button:?})?;"
         )),
+        StatementKind::MouseHoldWhilePressed {
+            button,
+            watch_input,
+        } => {
+            let watch_expr = format_input_pressed_expr(*watch_input);
+            let inner_prefix = indent_prefix(indent_level.saturating_add(1));
+            let loop_prefix = indent_prefix(indent_level.saturating_add(2));
+            output_lines.push(format!("{prefix}if {watch_expr} {{"));
+            output_lines.push(format!(
+                "{inner_prefix}script_context.mouse_down(MouseButton::{button:?})?;"
+            ));
+            output_lines.push(format!(
+                "{inner_prefix}while !script_context.should_stop() && {watch_expr} {{"
+            ));
+            output_lines.push(format!(
+                "{loop_prefix}script_context.wait_fixed_ms({HOLD_POLL_DELAY_MS})?;"
+            ));
+            output_lines.push(format!("{inner_prefix}}}"));
+            output_lines.push(format!(
+                "{inner_prefix}script_context.mouse_up(MouseButton::{button:?})?;"
+            ));
+            output_lines.push(format!("{prefix}}}"));
+        }
         StatementKind::MouseMoveRelative {
             delta_x_px,
             delta_y_px,
@@ -326,7 +478,55 @@ fn emit_single_statement(
                 "{prefix}script_variables.insert({variable_name:?}, updated_value);"
             ));
         }
+        StatementKind::RunCustomBlock {
+            custom_block_id,
+            cached_name,
+        } => emit_custom_block_invocation(
+            custom_block_id,
+            cached_name,
+            &prefix,
+            custom_plan,
+            binding_mode,
+            output_lines,
+        ),
     }
+}
+
+fn emit_custom_block_invocation(
+    custom_block_id: &str,
+    cached_name: &str,
+    prefix: &str,
+    custom_plan: &CustomCodegenPlan<'_>,
+    binding_mode: VariableBindingMode,
+    output_lines: &mut Vec<String>,
+) {
+    let Some(resolved_tile) = custom_plan.lookup_tile(custom_block_id) else {
+        output_lines.push(format!(
+            "{prefix}// Missing custom tile: {} ({})",
+            sanitize_single_line_comment(cached_name),
+            sanitize_single_line_comment(custom_block_id)
+        ));
+        return;
+    };
+
+    let variable_arg = if resolved_tile.mutates_variables {
+        match binding_mode {
+            VariableBindingMode::Owned => ", &mut script_variables",
+            VariableBindingMode::MutRef | VariableBindingMode::SharedRef => ", script_variables",
+        }
+    } else if resolved_tile.uses_variables {
+        match binding_mode {
+            VariableBindingMode::Owned => ", &script_variables",
+            VariableBindingMode::MutRef | VariableBindingMode::SharedRef => ", script_variables",
+        }
+    } else {
+        ""
+    };
+
+    output_lines.push(format!(
+        "{prefix}{}(script_context{variable_arg})?;",
+        resolved_tile.function_name
+    ));
 }
 
 fn emit_gaussian_wait_lines(
@@ -436,123 +636,6 @@ fn format_condition_expr(condition: &ConditionExpr) -> String {
     }
 }
 
-fn inspect_program_features(program: &VisualProgram) -> ProgramFeatureFlags {
-    let mut flags = ProgramFeatureFlags::default();
-    for trigger_input in program.trigger.all_trigger_inputs() {
-        record_trigger_feature(trigger_input, &mut flags);
-    }
-    inspect_statement_slice_features(&program.statements, &mut flags);
-    flags
-}
-
-fn inspect_statement_slice_features(
-    statements: &[StatementBlock],
-    flags: &mut ProgramFeatureFlags,
-) {
-    for block in statements {
-        match &block.kind {
-            StatementKind::IfThen {
-                condition,
-                then_blocks,
-            } => {
-                inspect_condition_features(condition, flags);
-                inspect_statement_slice_features(then_blocks, flags);
-            }
-            StatementKind::IfThenElse {
-                condition,
-                then_blocks,
-                else_blocks,
-            } => {
-                inspect_condition_features(condition, flags);
-                inspect_statement_slice_features(then_blocks, flags);
-                inspect_statement_slice_features(else_blocks, flags);
-            }
-            StatementKind::WhileCondition {
-                condition,
-                body_blocks,
-            } => {
-                inspect_condition_features(condition, flags);
-                inspect_statement_slice_features(body_blocks, flags);
-            }
-            StatementKind::RepeatCount { body_blocks, .. } => {
-                inspect_statement_slice_features(body_blocks, flags);
-            }
-            StatementKind::MouseClick { .. }
-            | StatementKind::MouseDown { .. }
-            | StatementKind::MouseUp { .. } => flags.uses_mouse_button = true,
-            StatementKind::KeyTap { .. }
-            | StatementKind::KeyDown { .. }
-            | StatementKind::KeyUp { .. } => flags.uses_key_code = true,
-            StatementKind::WaitRandomGaussian { .. } => flags.uses_gaussian_range = true,
-            StatementKind::SetVariable { .. } | StatementKind::ChangeVariable { .. } => {
-                flags.uses_variables = true;
-                flags.mutates_variables = true;
-            }
-            StatementKind::BreakLoop
-            | StatementKind::StopScript
-            | StatementKind::DoNothing
-            | StatementKind::MouseMoveRelative { .. }
-            | StatementKind::MouseScroll { .. }
-            | StatementKind::TypeText { .. }
-            | StatementKind::WaitFixed { .. }
-            | StatementKind::WaitRandomUniform { .. } => {}
-        }
-    }
-}
-
-fn inspect_condition_features(condition: &ConditionExpr, flags: &mut ProgramFeatureFlags) {
-    match condition {
-        ConditionExpr::IsInputPressed { input } => record_trigger_feature(*input, flags),
-        ConditionExpr::RandomChance { .. } => flags.uses_random_chance = true,
-        ConditionExpr::CompareVariable { .. } => flags.uses_variables = true,
-        ConditionExpr::Not { inner_condition } => {
-            inspect_condition_features(inner_condition, flags);
-        }
-        ConditionExpr::And {
-            left_condition,
-            right_condition,
-        }
-        | ConditionExpr::Or {
-            left_condition,
-            right_condition,
-        } => {
-            inspect_condition_features(left_condition, flags);
-            inspect_condition_features(right_condition, flags);
-        }
-    }
-}
-
-fn record_trigger_feature(trigger: InputTrigger, flags: &mut ProgramFeatureFlags) {
-    match trigger {
-        InputTrigger::Mouse(_) => flags.uses_mouse_button = true,
-        InputTrigger::Key(_) => flags.uses_key_code = true,
-    }
-}
-
-fn slice_contains_wait_action(statements: &[StatementBlock]) -> bool {
-    statements.iter().any(|block| match &block.kind {
-        StatementKind::WaitFixed { .. }
-        | StatementKind::WaitRandomUniform { .. }
-        | StatementKind::WaitRandomGaussian { .. } => true,
-        StatementKind::IfThen { then_blocks, .. } => slice_contains_wait_action(then_blocks),
-        StatementKind::IfThenElse {
-            then_blocks,
-            else_blocks,
-            ..
-        } => slice_contains_wait_action(then_blocks) || slice_contains_wait_action(else_blocks),
-        StatementKind::WhileCondition { body_blocks, .. }
-        | StatementKind::RepeatCount { body_blocks, .. } => slice_contains_wait_action(body_blocks),
-        _ => false,
-    })
-}
-
-fn slice_ends_with_terminator(statements: &[StatementBlock]) -> bool {
-    matches!(
-        statements.last().map(|block| &block.kind),
-        Some(StatementKind::BreakLoop | StatementKind::StopScript)
-    )
-}
-
 fn indent_prefix(indent_level: usize) -> String {
     " ".repeat(indent_level.saturating_mul(INDENT_WIDTH_SPACES))
 }
@@ -585,105 +668,5 @@ fn sanitize_single_line_comment(raw_text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use clickforge_sdk::KeyCode;
-
-    use super::*;
-
-    #[test]
-    fn generates_clean_rust_source_for_building_upgrade_template() {
-        let template_script = ScriptDocument::new_building_upgrade_template();
-        let generated_source = generate_rust_source_from_script(&template_script);
-
-        assert!(
-            generated_source.contains(
-                "pub fn run_script(script_context: &mut ScriptContext) -> ScriptResult<()>"
-            )
-        );
-        assert!(
-            generated_source
-                .contains("GaussianRangeMs::new(10.0_f64, 20.0_f64, 15.0_f64, 2.5_f64)?")
-        );
-        assert!(generated_source.contains("wait_base_plus_gaussian_ms(45, gaussian_range_ms)?"));
-        assert!(generated_source.contains("mouse_click(MouseButton::Left, 12)?"));
-        assert!(!generated_source.contains(".unwrap()"));
-        assert!(!generated_source.contains(".expect("));
-    }
-
-    #[test]
-    fn generates_variables_random_chance_and_nested_control_flow() {
-        let mut script = ScriptDocument::new_building_upgrade_template();
-        script.visual_program = VisualProgram::new(TriggerBlock::OnInputToggle {
-            trigger_input: InputTrigger::Key(KeyCode::F7),
-            additional_held_inputs: Vec::new(),
-        });
-        script
-            .visual_program
-            .append_root_block(StatementKind::SetVariable {
-                variable_name: "step_count".to_string(),
-                value: 0.0,
-            });
-        let tap_block = script.visual_program.create_block(StatementKind::KeyTap {
-            key_code: KeyCode::E,
-            hold_duration_ms: 10,
-        });
-        script
-            .visual_program
-            .append_root_block(StatementKind::IfThen {
-                condition: ConditionExpr::And {
-                    left_condition: Box::new(ConditionExpr::RandomChance {
-                        chance_percent: 50.0,
-                    }),
-                    right_condition: Box::new(ConditionExpr::CompareVariable {
-                        variable_name: "step_count".to_string(),
-                        operator: ComparisonOperator::LessThan,
-                        target_value: 5.0,
-                    }),
-                },
-                then_blocks: vec![tap_block],
-            });
-
-        let generated_source = generate_rust_source_from_script(&script);
-        assert!(generated_source.contains("use std::collections::HashMap;"));
-        assert!(generated_source.contains("use rand::RngExt;"));
-        assert!(generated_source.contains("let mut is_toggle_active = false;"));
-        assert!(generated_source.contains("KeyCode::F7"));
-        assert!(generated_source.contains("KeyCode::E"));
-        assert!(!generated_source.contains(".unwrap()"));
-    }
-
-    #[test]
-    fn generates_chord_trigger_conditions_and_do_nothing_comment() {
-        let mut script = ScriptDocument::new_building_upgrade_template();
-        script.visual_program = VisualProgram::new(TriggerBlock::WhileInputHeld {
-            trigger_input: InputTrigger::Mouse(clickforge_sdk::MouseButton::Left),
-            additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
-        });
-        let noop_block = script.visual_program.create_block(StatementKind::DoNothing);
-        let click_block = script
-            .visual_program
-            .create_block(StatementKind::MouseClick {
-                mouse_button: clickforge_sdk::MouseButton::Left,
-                hold_duration_ms: 12,
-            });
-        script
-            .visual_program
-            .append_root_block(StatementKind::IfThenElse {
-                condition: ConditionExpr::RandomChance {
-                    chance_percent: 25.0,
-                },
-                then_blocks: vec![noop_block],
-                else_blocks: vec![click_block],
-            });
-
-        let generated_source = generate_rust_source_from_script(&script);
-        assert!(generated_source.contains("KeyCode"));
-        assert!(generated_source.contains("MouseButton"));
-        assert!(generated_source.contains(
-            "script_context.is_mouse_pressed(MouseButton::Left)? && script_context.is_key_pressed(KeyCode::LeftShift)?"
-        ));
-        assert!(generated_source.contains("// Do nothing (explicit no-op block)"));
-        assert!(!generated_source.contains(".unwrap()"));
-        assert!(!generated_source.contains(".expect("));
-    }
-}
+#[path = "rust_codegen_tests.rs"]
+mod tests;

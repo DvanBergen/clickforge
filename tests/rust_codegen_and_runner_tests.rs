@@ -6,14 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clickforge::engine::generate_rust_source_from_script;
 use clickforge::engine::rust_script_runner::{
     RustExecutionHooks, compile_rust_script, run_compiled_rust_script,
 };
-use clickforge::models::{
-    InputError, InputSink, PhysicalInputReader, ScriptDocument, ScriptMode, TargetScope,
+use clickforge::engine::{
+    generate_rust_source_from_script, generate_rust_source_with_custom_blocks,
 };
-use clickforge_sdk::{KeyCode, MouseButton};
+use clickforge::models::{
+    BlockId, CustomBlockColor, CustomBlockDefinition, InputError, InputSink, PhysicalInputReader,
+    ScriptDocument, ScriptMode, StatementBlock, StatementKind, TargetScope, TriggerBlock,
+    VisualProgram,
+};
+use clickforge_sdk::{InputTrigger, KeyCode, MouseButton};
 
 struct EphemeralCacheGuard {
     cache_directory: PathBuf,
@@ -288,5 +292,89 @@ fn exported_visual_blocks_compile_run_over_unix_ipc_and_sigkill_unresponsive_chi
         "SIGKILL termination of unresponsive child took {sigkill_elapsed_ms} ms"
     );
     assert!(hung_sink.release_all_calls() >= 1);
+    Ok(())
+}
+
+#[test]
+fn generated_rust_for_mouse_hold_and_nested_custom_tiles_compiles_cleanly() -> Result<(), String> {
+    let cache_guard = EphemeralCacheGuard::create("custom-tiles-codegen")?;
+
+    let mut hold_tile = CustomBlockDefinition::from_statements(
+        "Drag Hold",
+        "Holds left mouse button while physically pressed",
+        CustomBlockColor::Coral,
+        vec![
+            StatementBlock {
+                id: BlockId(1),
+                kind: StatementKind::ChangeVariable {
+                    variable_name: "hold_count".to_string(),
+                    delta_value: 1.0,
+                },
+            },
+            StatementBlock {
+                id: BlockId(2),
+                kind: StatementKind::MouseHoldWhilePressed {
+                    button: MouseButton::Left,
+                    watch_input: InputTrigger::Mouse(MouseButton::Left),
+                },
+            },
+        ],
+    );
+    hold_tile.id = "tile-drag-hold".to_string();
+
+    let mut wrapper_tile = CustomBlockDefinition::from_statements(
+        "Smart Drag",
+        "Invokes drag hold then taps E",
+        CustomBlockColor::Blue,
+        vec![
+            StatementBlock {
+                id: BlockId(1),
+                kind: StatementKind::RunCustomBlock {
+                    custom_block_id: "tile-drag-hold".to_string(),
+                    cached_name: "Drag Hold".to_string(),
+                },
+            },
+            StatementBlock {
+                id: BlockId(2),
+                kind: StatementKind::KeyTap {
+                    key_code: KeyCode::E,
+                    hold_duration_ms: 8,
+                },
+            },
+        ],
+    );
+    wrapper_tile.id = "tile-smart-drag".to_string();
+
+    let mut visual_script = ScriptDocument::new_building_upgrade_template();
+    visual_script.visual_program = VisualProgram::new(TriggerBlock::OnInputPressed {
+        trigger_input: InputTrigger::Mouse(MouseButton::Left),
+        additional_held_inputs: Vec::new(),
+    });
+    visual_script
+        .visual_program
+        .append_root_block(StatementKind::RunCustomBlock {
+            custom_block_id: "tile-smart-drag".to_string(),
+            cached_name: "Smart Drag".to_string(),
+        });
+
+    let generated_source =
+        generate_rust_source_with_custom_blocks(&visual_script, &[wrapper_tile, hold_tile]);
+    assert!(generated_source.contains("fn run_custom_tile_smart_drag("));
+    assert!(generated_source.contains("fn run_custom_tile_drag_hold("));
+    assert!(generated_source.contains("script_context.mouse_down(MouseButton::Left)?;"));
+    assert!(generated_source.contains("script_context.mouse_up(MouseButton::Left)?;"));
+    assert!(!generated_source.contains(".unwrap()"));
+    assert!(!generated_source.contains(".expect("));
+
+    let mut compile_script = visual_script;
+    compile_script.mode = ScriptMode::AdvancedRust;
+    compile_script.rust_source = generated_source;
+
+    let compile_snapshot = compile_rust_script(&compile_script, &cache_guard.cache_directory);
+    assert!(
+        compile_snapshot.is_success,
+        "expected generated custom-tile Rust source to compile cleanly, got: {:?}",
+        compile_snapshot.diagnostics
+    );
     Ok(())
 }

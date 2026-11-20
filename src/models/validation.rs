@@ -5,6 +5,9 @@ use thiserror::Error;
 use crate::models::blocks::{
     BlockId, ConditionExpr, MAX_TRIGGER_AND_INPUTS, StatementBlock, StatementKind,
 };
+use crate::models::custom_blocks::{
+    CustomBlockDefinition, MAX_CUSTOM_BLOCK_CALL_DEPTH, lookup_custom_block,
+};
 use crate::models::script::{ScriptDocument, ScriptMode};
 use crate::models::target::TargetScope;
 
@@ -57,6 +60,9 @@ pub enum ValidationIssueCode {
     EmptyRustSource,
     RustSourceTooLarge,
     TypeTextTooLong,
+    MissingCustomBlock,
+    CyclicCustomBlock,
+    KillSwitchCollision,
 }
 
 /// Single actionable validation finding attached optionally to a specific visual block.
@@ -119,6 +125,14 @@ pub enum ValidationError {
 
 /// Inspects a script and returns every safety, key-collision, timing, and target issue found.
 pub fn inspect_script_validation(script: &ScriptDocument) -> ValidationReport {
+    inspect_script_validation_with_custom_blocks(script, &[])
+}
+
+/// Inspects a script while resolving custom tile references transitively against `custom_blocks`.
+pub fn inspect_script_validation_with_custom_blocks(
+    script: &ScriptDocument,
+    custom_blocks: &[CustomBlockDefinition],
+) -> ValidationReport {
     let mut report = ValidationReport::default();
 
     validate_script_name(&script.name, &mut report);
@@ -126,7 +140,7 @@ pub fn inspect_script_validation(script: &ScriptDocument) -> ValidationReport {
     validate_kill_switch_and_key_bindings(script, &mut report);
 
     match script.mode {
-        ScriptMode::VisualBlocks => validate_visual_program(script, &mut report),
+        ScriptMode::VisualBlocks => validate_visual_program(script, custom_blocks, &mut report),
         ScriptMode::AdvancedRust => validate_rust_source(&script.rust_source, &mut report),
     }
 
@@ -137,7 +151,15 @@ pub fn inspect_script_validation(script: &ScriptDocument) -> ValidationReport {
 pub fn validate_script_for_persistence_and_execution(
     script: &ScriptDocument,
 ) -> Result<(), ValidationError> {
-    let report = inspect_script_validation(script);
+    validate_script_with_custom_blocks(script, &[])
+}
+
+/// Enforces the mandatory validation gate with transitive custom tile resolution.
+pub fn validate_script_with_custom_blocks(
+    script: &ScriptDocument,
+    custom_blocks: &[CustomBlockDefinition],
+) -> Result<(), ValidationError> {
+    let report = inspect_script_validation_with_custom_blocks(script, custom_blocks);
     if report.is_valid() {
         return Ok(());
     }
@@ -151,6 +173,13 @@ pub fn validate_script_for_persistence_and_execution(
         first_message,
         report,
     })
+}
+
+pub(crate) fn validate_statement_slice_bounds(
+    statements: &[StatementBlock],
+    report: &mut ValidationReport,
+) {
+    validate_statement_slice_with_options(statements, None, None, report);
 }
 
 fn validate_script_name(script_name: &str, report: &mut ValidationReport) {
@@ -284,7 +313,11 @@ fn validate_rust_source(rust_source: &str, report: &mut ValidationReport) {
     }
 }
 
-fn validate_visual_program(script: &ScriptDocument, report: &mut ValidationReport) {
+fn validate_visual_program(
+    script: &ScriptDocument,
+    custom_blocks: &[CustomBlockDefinition],
+    report: &mut ValidationReport,
+) {
     let additional_input_count = script.visual_program.trigger.additional_held_inputs().len();
     if additional_input_count > MAX_TRIGGER_AND_INPUTS {
         report.push_issue(
@@ -315,36 +348,44 @@ fn validate_visual_program(script: &ScriptDocument, report: &mut ValidationRepor
             ),
         );
     }
-    validate_statement_slice(
+    validate_statement_slice_with_options(
         &script.visual_program.statements,
-        script.kill_switch_key,
+        None,
+        Some((script.kill_switch_key, custom_blocks)),
         report,
     );
 }
 
-fn validate_statement_slice(
+fn validate_statement_slice_with_options(
     statements: &[StatementBlock],
-    kill_switch_key: Option<KeyCode>,
+    override_block_id: Option<BlockId>,
+    custom_context: Option<(Option<KeyCode>, &[CustomBlockDefinition])>,
     report: &mut ValidationReport,
 ) {
     for block in statements {
-        validate_single_statement(block, kill_switch_key, report);
+        validate_single_statement(block, override_block_id, custom_context, report);
     }
 }
 
 fn validate_single_statement(
     block: &StatementBlock,
-    kill_switch_key: Option<KeyCode>,
+    override_block_id: Option<BlockId>,
+    custom_context: Option<(Option<KeyCode>, &[CustomBlockDefinition])>,
     report: &mut ValidationReport,
 ) {
-    let block_id = Some(block.id);
+    let block_id = override_block_id.or(Some(block.id));
     match &block.kind {
         StatementKind::IfThen {
             condition,
             then_blocks,
         } => {
             validate_condition(condition, block_id, report);
-            validate_statement_slice(then_blocks, kill_switch_key, report);
+            validate_statement_slice_with_options(
+                then_blocks,
+                override_block_id,
+                custom_context,
+                report,
+            );
         }
         StatementKind::IfThenElse {
             condition,
@@ -352,15 +393,30 @@ fn validate_single_statement(
             else_blocks,
         } => {
             validate_condition(condition, block_id, report);
-            validate_statement_slice(then_blocks, kill_switch_key, report);
-            validate_statement_slice(else_blocks, kill_switch_key, report);
+            validate_statement_slice_with_options(
+                then_blocks,
+                override_block_id,
+                custom_context,
+                report,
+            );
+            validate_statement_slice_with_options(
+                else_blocks,
+                override_block_id,
+                custom_context,
+                report,
+            );
         }
         StatementKind::WhileCondition {
             condition,
             body_blocks,
         } => {
             validate_condition(condition, block_id, report);
-            validate_statement_slice(body_blocks, kill_switch_key, report);
+            validate_statement_slice_with_options(
+                body_blocks,
+                override_block_id,
+                custom_context,
+                report,
+            );
         }
         StatementKind::RepeatCount {
             repeat_count,
@@ -373,7 +429,12 @@ fn validate_single_statement(
                     format!("Repeat count must be between 1 and {MAX_REPEAT_COUNT}."),
                 );
             }
-            validate_statement_slice(body_blocks, kill_switch_key, report);
+            validate_statement_slice_with_options(
+                body_blocks,
+                override_block_id,
+                custom_context,
+                report,
+            );
         }
         StatementKind::MouseClick {
             hold_duration_ms, ..
@@ -457,15 +518,163 @@ fn validate_single_statement(
             variable_name,
             delta_value,
         } => validate_variable_mutation(variable_name, *delta_value, block_id, report),
+        StatementKind::RunCustomBlock {
+            custom_block_id,
+            cached_name,
+        } => {
+            if let Some((kill_switch_key, custom_blocks)) = custom_context {
+                validate_custom_block_call(
+                    custom_block_id,
+                    cached_name,
+                    block_id,
+                    kill_switch_key,
+                    custom_blocks,
+                    report,
+                );
+            }
+        }
         StatementKind::BreakLoop
         | StatementKind::StopScript
         | StatementKind::DoNothing
         | StatementKind::MouseDown { .. }
         | StatementKind::MouseUp { .. }
+        | StatementKind::MouseHoldWhilePressed { .. }
         | StatementKind::MouseMoveRelative { .. }
         | StatementKind::MouseScroll { .. }
         | StatementKind::KeyDown { .. }
         | StatementKind::KeyUp { .. } => {}
+    }
+}
+
+fn validate_custom_block_call(
+    custom_block_id: &str,
+    cached_name: &str,
+    calling_block_id: Option<BlockId>,
+    kill_switch_key: Option<KeyCode>,
+    custom_blocks: &[CustomBlockDefinition],
+    report: &mut ValidationReport,
+) {
+    let Some(root_definition) = lookup_custom_block(custom_blocks, custom_block_id) else {
+        let display_label = if cached_name.trim().is_empty() {
+            custom_block_id
+        } else {
+            cached_name
+        };
+        report.push_issue(
+            ValidationIssueCode::MissingCustomBlock,
+            calling_block_id,
+            format!("Custom tile '{display_label}' ({custom_block_id}) was not found."),
+        );
+        return;
+    };
+
+    let mut active_call_stack: Vec<&str> = Vec::with_capacity(MAX_CUSTOM_BLOCK_CALL_DEPTH);
+    let mut checked_tile_ids: Vec<&str> = Vec::new();
+    active_call_stack.push(root_definition.id.as_str());
+    validate_resolved_custom_block_tree(
+        root_definition,
+        calling_block_id,
+        kill_switch_key,
+        custom_blocks,
+        &mut active_call_stack,
+        &mut checked_tile_ids,
+        report,
+    );
+}
+
+fn validate_resolved_custom_block_tree<'library>(
+    definition: &'library CustomBlockDefinition,
+    calling_block_id: Option<BlockId>,
+    kill_switch_key: Option<KeyCode>,
+    custom_blocks: &'library [CustomBlockDefinition],
+    active_call_stack: &mut Vec<&'library str>,
+    checked_tile_ids: &mut Vec<&'library str>,
+    report: &mut ValidationReport,
+) {
+    if !checked_tile_ids.contains(&definition.id.as_str()) {
+        checked_tile_ids.push(definition.id.as_str());
+        validate_custom_tile_safety(definition, calling_block_id, kill_switch_key, report);
+    }
+
+    for nested_id in definition.referenced_custom_block_ids() {
+        if active_call_stack.contains(&nested_id.as_str()) {
+            report.push_issue(
+                ValidationIssueCode::CyclicCustomBlock,
+                calling_block_id,
+                format!(
+                    "Custom tile '{}' contains cyclic recursion involving '{nested_id}'.",
+                    definition.name
+                ),
+            );
+            continue;
+        }
+        if active_call_stack.len() >= MAX_CUSTOM_BLOCK_CALL_DEPTH {
+            report.push_issue(
+                ValidationIssueCode::CyclicCustomBlock,
+                calling_block_id,
+                format!(
+                    "Custom tile '{}' exceeds maximum nesting depth of {MAX_CUSTOM_BLOCK_CALL_DEPTH}.",
+                    definition.name
+                ),
+            );
+            continue;
+        }
+        let Some(nested_definition) = lookup_custom_block(custom_blocks, &nested_id) else {
+            report.push_issue(
+                ValidationIssueCode::MissingCustomBlock,
+                calling_block_id,
+                format!(
+                    "Custom tile '{}' references missing custom tile '{nested_id}'.",
+                    definition.name
+                ),
+            );
+            continue;
+        };
+        active_call_stack.push(nested_definition.id.as_str());
+        validate_resolved_custom_block_tree(
+            nested_definition,
+            calling_block_id,
+            kill_switch_key,
+            custom_blocks,
+            active_call_stack,
+            checked_tile_ids,
+            report,
+        );
+        active_call_stack.pop();
+    }
+}
+
+fn validate_custom_tile_safety(
+    definition: &CustomBlockDefinition,
+    calling_block_id: Option<BlockId>,
+    kill_switch_key: Option<KeyCode>,
+    report: &mut ValidationReport,
+) {
+    validate_statement_slice_with_options(&definition.statements, calling_block_id, None, report);
+    let Some(kill_key) = kill_switch_key else {
+        return;
+    };
+    if definition.collect_emitted_keys().contains(&kill_key) {
+        report.push_issue(
+            ValidationIssueCode::KillSwitchCollision,
+            calling_block_id,
+            format!(
+                "Hard Kill-Switch key ({}) collides with a key emitted inside custom tile '{}'.",
+                kill_key.display_label(),
+                definition.name
+            ),
+        );
+    }
+    if definition.collect_condition_keys().contains(&kill_key) {
+        report.push_issue(
+            ValidationIssueCode::KillSwitchCollision,
+            calling_block_id,
+            format!(
+                "Hard Kill-Switch key ({}) collides with an input checked inside custom tile '{}'.",
+                kill_key.display_label(),
+                definition.name
+            ),
+        );
     }
 }
 
@@ -561,117 +770,5 @@ fn validate_condition(
 }
 
 #[cfg(test)]
-mod tests {
-    use clickforge_sdk::MouseButton;
-
-    use super::*;
-    use crate::models::blocks::TriggerBlock;
-    use crate::models::target::GameTargetRule;
-
-    #[test]
-    fn building_upgrade_template_passes_validation_gate() {
-        let template_script = ScriptDocument::new_building_upgrade_template();
-        assert!(validate_script_for_persistence_and_execution(&template_script).is_ok());
-    }
-
-    #[test]
-    fn blank_script_without_kill_switch_is_rejected() {
-        let blank_script = ScriptDocument::new_blank(
-            "Unnamed Clicker",
-            TargetScope::Global,
-            ScriptMode::VisualBlocks,
-        );
-        let report = inspect_script_validation(&blank_script);
-        assert!(report.has_issue(ValidationIssueCode::MissingKillSwitchKey));
-        assert!(validate_script_for_persistence_and_execution(&blank_script).is_err());
-    }
-
-    #[test]
-    fn kill_switch_collisions_with_trigger_arm_and_emitted_keys_are_rejected() {
-        let mut script = ScriptDocument::new_building_upgrade_template();
-        script.kill_switch_key = Some(KeyCode::F6);
-        let arm_report = inspect_script_validation(&script);
-        assert!(arm_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithArmToggleKey));
-
-        script.arm_toggle_key = Some(KeyCode::F7);
-        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
-            trigger_input: InputTrigger::Key(KeyCode::F6),
-            additional_held_inputs: Vec::new(),
-        };
-        let trigger_report = inspect_script_validation(&script);
-        assert!(trigger_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey));
-
-        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
-            trigger_input: InputTrigger::Mouse(MouseButton::Left),
-            additional_held_inputs: Vec::new(),
-        };
-        script.kill_switch_key = Some(KeyCode::E);
-        script
-            .visual_program
-            .append_root_block(StatementKind::TypeText {
-                text: "hello".to_string(),
-                keystroke_delay_ms: 10,
-                jitter_ms: 2,
-            });
-        let emitted_report = inspect_script_validation(&script);
-        assert!(emitted_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithEmittedKey));
-    }
-
-    #[test]
-    fn additional_chord_inputs_cannot_collide_with_kill_switch_or_exceed_cap() {
-        let mut script = ScriptDocument::new_building_upgrade_template();
-        script.kill_switch_key = Some(KeyCode::F8);
-        script.arm_toggle_key = Some(KeyCode::F6);
-        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
-            trigger_input: InputTrigger::Mouse(MouseButton::Left),
-            additional_held_inputs: vec![
-                InputTrigger::Key(KeyCode::LeftShift),
-                InputTrigger::Key(KeyCode::F8),
-                InputTrigger::Key(KeyCode::F6),
-            ],
-        };
-
-        let collision_report = inspect_script_validation(&script);
-        assert!(collision_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey));
-        assert!(collision_report.has_issue(ValidationIssueCode::ArmToggleCollidesWithTriggerKey));
-
-        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
-            trigger_input: InputTrigger::Mouse(MouseButton::Left),
-            additional_held_inputs: vec![
-                InputTrigger::Key(KeyCode::LeftShift),
-                InputTrigger::Key(KeyCode::LeftCtrl),
-                InputTrigger::Key(KeyCode::LeftAlt),
-                InputTrigger::Key(KeyCode::Space),
-                InputTrigger::Key(KeyCode::Tab),
-            ],
-        };
-        let cap_report = inspect_script_validation(&script);
-        assert!(cap_report.has_issue(ValidationIssueCode::TooManyTriggerInputs));
-    }
-
-    #[test]
-    fn invalid_timing_and_empty_selected_game_rule_are_rejected() {
-        let mut script = ScriptDocument::new_building_upgrade_template();
-        script.target_scope = TargetScope::SelectedGame(GameTargetRule::default());
-        script
-            .visual_program
-            .append_root_block(StatementKind::WaitRandomUniform {
-                min_delay_ms: 200,
-                max_delay_ms: 100,
-            });
-        script
-            .visual_program
-            .append_root_block(StatementKind::WaitRandomGaussian {
-                base_delay_ms: 20,
-                min_offset_ms: 50.0,
-                max_offset_ms: 10.0,
-                mean_offset_ms: 30.0,
-                std_dev_ms: 2.0,
-            });
-
-        let report = inspect_script_validation(&script);
-        assert!(report.has_issue(ValidationIssueCode::InvalidSelectedGameTarget));
-        assert!(report.has_issue(ValidationIssueCode::InvalidTimingRange));
-        assert!(report.has_issue(ValidationIssueCode::InvalidGaussianParameters));
-    }
-}
+#[path = "validation_tests.rs"]
+mod tests;

@@ -11,13 +11,14 @@ use crate::engine::coordinator::{CoordinatorStartConfig, KeyCaptureState, Window
 use crate::engine::coordinator_telemetry::CoordinatorTelemetryStore;
 use crate::engine::rust_script_runner::default_script_build_cache_dir;
 use crate::engine::worker_supervisor::{
-    RustWorkerLaunchOutcome, ScriptWorkerSupervisor, WorkerEvent, compute_script_revision_hash,
+    RustWorkerLaunchOutcome, ScriptWorkerSupervisor, WorkerEvent, compute_custom_blocks_hash,
+    compute_script_revision_hash,
 };
 use crate::models::{
     ActiveWindowSnapshot, CompileResultSnapshot, CoordinatorCommand, CoordinatorSnapshot,
-    InputSink, PhysicalInputReader, ScriptDocument, ScriptExecutionPhase, ScriptMode,
-    TelemetryLevel, TriggerInterceptControl, TriggerInterceptSpec,
-    validate_script_for_persistence_and_execution,
+    CustomBlockDefinition, InputSink, PhysicalInputReader, ScriptDocument, ScriptExecutionPhase,
+    ScriptMode, TelemetryLevel, TriggerInterceptControl, TriggerInterceptSpec,
+    validate_script_with_custom_blocks,
 };
 
 const MAX_WORKER_EVENT_QUEUE_CAPACITY: usize = 512;
@@ -26,6 +27,8 @@ const WINDOW_REFRESH_INTERVAL_MS: u64 = 750;
 
 pub(crate) struct CoordinatorLoop {
     scripts: Vec<ScriptDocument>,
+    custom_blocks: Arc<Vec<CustomBlockDefinition>>,
+    custom_blocks_hash: u64,
     arm_toggle_by_id: HashMap<String, bool>,
     self_stopped_revision_by_id: HashMap<String, u64>,
     polled_arm_key_state: HashMap<KeyCode, bool>,
@@ -67,8 +70,11 @@ impl CoordinatorLoop {
             config.on_ui_repaint_needed,
         );
 
+        let initial_custom_blocks_hash = compute_custom_blocks_hash(&config.initial_custom_blocks);
         let mut coordinator = Self {
             scripts: Vec::new(),
+            custom_blocks: Arc::new(config.initial_custom_blocks),
+            custom_blocks_hash: initial_custom_blocks_hash,
             arm_toggle_by_id: HashMap::new(),
             self_stopped_revision_by_id: HashMap::new(),
             polled_arm_key_state: HashMap::new(),
@@ -134,6 +140,9 @@ impl CoordinatorLoop {
     fn handle_command(&mut self, command: CoordinatorCommand) {
         match command {
             CoordinatorCommand::SyncScripts(incoming) => self.apply_sync_scripts(incoming),
+            CoordinatorCommand::SyncCustomBlocks(updated_custom_blocks) => {
+                self.apply_sync_custom_blocks(updated_custom_blocks);
+            }
             CoordinatorCommand::UpsertScript(script) => self.apply_upsert_script(script),
             CoordinatorCommand::RemoveScript { script_id } => self.apply_remove_script(&script_id),
             CoordinatorCommand::SetScriptEnabled {
@@ -210,6 +219,19 @@ impl CoordinatorLoop {
         }
     }
 
+    fn apply_sync_custom_blocks(&mut self, updated_custom_blocks: Vec<CustomBlockDefinition>) {
+        let tile_count = updated_custom_blocks.len();
+        self.custom_blocks_hash = compute_custom_blocks_hash(&updated_custom_blocks);
+        self.custom_blocks = Arc::new(updated_custom_blocks);
+        self.self_stopped_revision_by_id.clear();
+        self.failed_intercept_attempt = None;
+        self.telemetry.record_log(
+            TelemetryLevel::Info,
+            None,
+            format!("Synced {tile_count} custom tile(s)."),
+        );
+    }
+
     fn apply_upsert_script(&mut self, script: ScriptDocument) {
         let script_id = script.id.clone();
         self.self_stopped_revision_by_id.remove(&script_id);
@@ -241,7 +263,7 @@ impl CoordinatorLoop {
             return;
         }
         if let Err(validation_error) =
-            validate_script_for_persistence_and_execution(&self.scripts[script_index])
+            validate_script_with_custom_blocks(&self.scripts[script_index], &self.custom_blocks)
         {
             let error_message = validation_error.to_string();
             self.scripts[script_index].is_enabled = false;
@@ -519,7 +541,9 @@ impl CoordinatorLoop {
             );
             return None;
         }
-        if let Err(validation_error) = validate_script_for_persistence_and_execution(script) {
+        if let Err(validation_error) =
+            validate_script_with_custom_blocks(script, &self.custom_blocks)
+        {
             self.supervisor.stop_worker_for_script(script_id);
             self.telemetry
                 .set_script_error(script_id, validation_error.to_string());
@@ -560,7 +584,7 @@ impl CoordinatorLoop {
             return None;
         }
 
-        let revision_hash = compute_script_revision_hash(script);
+        let revision_hash = compute_script_revision_hash(script, self.custom_blocks_hash);
         if self.self_stopped_revision_by_id.get(script_id) == Some(&revision_hash) {
             return None;
         }
@@ -592,6 +616,7 @@ impl CoordinatorLoop {
                 self.supervisor.spawn_visual_worker(
                     script,
                     revision_hash,
+                    Arc::clone(&self.custom_blocks),
                     Arc::clone(&self.input_sink),
                     Arc::clone(&self.physical_input),
                 );

@@ -8,7 +8,7 @@ use egui::{
     Sense, Shadow, Stroke, Style, TextStyle, Visuals, vec2,
 };
 
-use crate::models::{BlockCategory, ScriptExecutionPhase};
+use crate::models::{BlockCategory, CustomBlockColor, ScriptExecutionPhase};
 
 /// Deep charcoal backdrop used behind the visual block canvas and code editor.
 pub const BG_CANVAS: Color32 = Color32::from_rgb(0x11, 0x13, 0x17);
@@ -84,6 +84,9 @@ pub const CATEGORY_TIMING: Color32 = Color32::from_rgb(0x2A, 0x9D, 0x8F);
 
 /// Block category accent for Variable and state blocks.
 pub const CATEGORY_VARIABLE: Color32 = Color32::from_rgb(0x7A, 0x86, 0x99);
+
+/// Block category accent for user-defined reusable Custom Tile blocks.
+pub const CATEGORY_CUSTOM: Color32 = Color32::from_rgb(0xD9, 0x5B, 0x66);
 
 /// Syntax color for Rust language keywords.
 pub const SYNTAX_KEYWORD: Color32 = Color32::from_rgb(0xE5, 0x9A, 0x38);
@@ -314,6 +317,40 @@ pub fn block_visual_colors(category: BlockCategory) -> BlockVisualColors {
             text_primary: Color32::from_rgb(0xEF, 0xF3, 0xF8),
             text_muted: Color32::from_rgb(0xB8, 0xC4, 0xD6),
         },
+        BlockCategory::Custom => BlockVisualColors {
+            fill: Color32::from_rgb(0x4A, 0x1F, 0x28),
+            fill_hover: Color32::from_rgb(0x5C, 0x27, 0x32),
+            border: CATEGORY_CUSTOM,
+            top_highlight: Color32::from_rgb(0xEB, 0x83, 0x8D),
+            spine_fill: Color32::from_rgb(0x3D, 0x19, 0x21),
+            pill_well_bg: Color32::from_rgb(0x26, 0x10, 0x15),
+            pill_well_border: Color32::from_rgb(0x8F, 0x3C, 0x46),
+            badge_bg: Color32::from_rgb(0x63, 0x2A, 0x35),
+            text_primary: Color32::from_rgb(0xFF, 0xF0, 0xF2),
+            text_muted: Color32::from_rgb(0xE8, 0xB8, 0xBF),
+        },
+    }
+}
+
+/// Returns the Forge Slate block visual colors mapped to a user-selected `CustomBlockColor`.
+pub fn custom_block_visual_colors(color: CustomBlockColor) -> BlockVisualColors {
+    match color {
+        CustomBlockColor::Coral => block_visual_colors(BlockCategory::Custom),
+        CustomBlockColor::Blue => block_visual_colors(BlockCategory::Action),
+        CustomBlockColor::Teal => block_visual_colors(BlockCategory::Timing),
+        CustomBlockColor::Gold => block_visual_colors(BlockCategory::Control),
+        CustomBlockColor::Amber => block_visual_colors(BlockCategory::Trigger),
+    }
+}
+
+/// Returns the crisp swatch accent color displayed for a `CustomBlockColor` selector pill.
+pub fn custom_block_swatch_color(color: CustomBlockColor) -> Color32 {
+    match color {
+        CustomBlockColor::Coral => CATEGORY_CUSTOM,
+        CustomBlockColor::Blue => CATEGORY_ACTION,
+        CustomBlockColor::Teal => CATEGORY_TIMING,
+        CustomBlockColor::Gold => CATEGORY_CONTROL,
+        CustomBlockColor::Amber => CATEGORY_TRIGGER,
     }
 }
 
@@ -554,6 +591,7 @@ pub fn category_color(category: BlockCategory) -> Color32 {
         BlockCategory::Action => CATEGORY_ACTION,
         BlockCategory::Timing => CATEGORY_TIMING,
         BlockCategory::Variable => CATEGORY_VARIABLE,
+        BlockCategory::Custom => CATEGORY_CUSTOM,
     }
 }
 

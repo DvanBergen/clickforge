@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::models::{ScriptDocument, validate_script_for_persistence_and_execution};
+use crate::models::{CustomBlockDefinition, ScriptDocument, validate_script_with_custom_blocks};
 use crate::storage::{
     StorageError, read_json_bounded, resolve_default_config_dir, write_json_atomically,
 };
@@ -63,7 +63,16 @@ impl ScriptRepository {
 
     /// Validates, backs up any prior copy, and atomically writes a script document to disk.
     pub fn save_script(&self, script: &ScriptDocument) -> Result<PathBuf, StorageError> {
-        validate_script_for_persistence_and_execution(script)?;
+        self.save_script_with_custom_blocks(script, &[])
+    }
+
+    /// Validates with `custom_blocks`, backs up any prior copy, and atomically writes a script.
+    pub fn save_script_with_custom_blocks(
+        &self,
+        script: &ScriptDocument,
+        custom_blocks: &[CustomBlockDefinition],
+    ) -> Result<PathBuf, StorageError> {
+        validate_script_with_custom_blocks(script, custom_blocks)?;
         validate_script_id(&script.id)?;
         self.ensure_directories_exist()?;
 

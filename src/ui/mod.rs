@@ -5,6 +5,7 @@ pub mod block_canvas;
 mod block_field_editors;
 pub mod block_node_renderer;
 pub mod block_palette;
+pub mod custom_block_modal;
 pub mod rust_editor_panel;
 pub mod script_settings_bar;
 pub mod sidebar;

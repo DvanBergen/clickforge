@@ -9,4 +9,4 @@ pub mod timing;
 mod worker_supervisor;
 
 pub use coordinator::{CoordinatorHandle, CoordinatorStartConfig, start_coordinator};
-pub use rust_codegen::generate_rust_source_from_script;
+pub use rust_codegen::{generate_rust_source_from_script, generate_rust_source_with_custom_blocks};

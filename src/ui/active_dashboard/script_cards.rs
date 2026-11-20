@@ -2,7 +2,7 @@ use egui::{Align, CornerRadius, Frame, Label, Layout, Margin, RichText, Sense, S
 
 use crate::models::{
     ScriptDocument, ScriptMode, ScriptRuntimeStatus, TargetScope, ValidationReport,
-    inspect_script_validation,
+    inspect_script_validation_with_custom_blocks,
 };
 use crate::ui::active_dashboard::status_classifier::classify_script_live_status;
 use crate::ui::active_dashboard::{
@@ -149,7 +149,8 @@ fn render_script_status_card(
     view_model: &ActiveDashboardViewModel<'_>,
     emitted_actions: &mut Vec<ActiveDashboardAction>,
 ) {
-    let validation_report = inspect_script_validation(script);
+    let validation_report =
+        inspect_script_validation_with_custom_blocks(script, view_model.custom_blocks);
     let is_valid = validation_report.is_valid();
     let status_info = classify_script_live_status(script, &validation_report, view_model.snapshot);
     let is_selected = view_model.selected_script_id == Some(script.id.as_str());
