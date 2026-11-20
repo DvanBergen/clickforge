@@ -14,8 +14,22 @@ use crate::ui::theme::{
 };
 
 const PILL_TEXT_SIZE_PX: f32 = 12.5;
-const KEY_PICKER_POPUP_WIDTH_PX: f32 = 316.0;
-const KEY_PICKER_SCROLL_HEIGHT_PX: f32 = 236.0;
+const KEY_PICKER_POPUP_WIDTH_PX: f32 = 436.0;
+const KEY_PICKER_SCROLL_HEIGHT_PX: f32 = 280.0;
+const KEY_PICKER_SCROLLBAR_RESERVE_PX: f32 = 18.0;
+const KEY_PICKER_CONTENT_WIDTH_PX: f32 =
+    KEY_PICKER_POPUP_WIDTH_PX - KEY_PICKER_SCROLLBAR_RESERVE_PX;
+const KEY_PICKER_CAPTURE_WIDTH_PX: f32 = 92.0;
+const KEY_PICKER_HEADER_GAP_PX: f32 = 8.0;
+const KEY_PICKER_SEARCH_WIDTH_PX: f32 =
+    KEY_PICKER_POPUP_WIDTH_PX - KEY_PICKER_CAPTURE_WIDTH_PX - KEY_PICKER_HEADER_GAP_PX - 16.0;
+const KEYCAP_GAP_PX: f32 = 4.0;
+const KEYCAP_HEIGHT_PX: f32 = 24.0;
+const KEYCAP_MIN_WIDTH_PX: f32 = 34.0;
+const KEYCAP_BUTTON_PADDING_X_PX: f32 = 5.0;
+const KEYCAP_BUTTON_PADDING_Y_PX: f32 = 2.5;
+const ESTIMATED_MONO_CHAR_WIDTH_PX: f32 = 7.6;
+const ESTIMATED_KEYCAP_CHROME_PX: f32 = 18.0;
 
 #[derive(Debug, Clone, Default)]
 struct KeyPickerPopupState {
@@ -88,7 +102,7 @@ pub(crate) fn render_mouse_button_combo<SaltType: Hash + Debug>(
     did_change
 }
 
-/// Renders a clickable key pill that opens a live-searchable categorized key picker popup.
+/// Renders a clickable key pill that opens a fixed-width searchable categorized key picker popup.
 pub(crate) fn render_key_code_picker<SaltType: Hash + Debug>(
     ui: &mut Ui,
     id_salt: SaltType,
@@ -126,6 +140,9 @@ pub(crate) fn render_key_code_picker<SaltType: Hash + Debug>(
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .width(KEY_PICKER_POPUP_WIDTH_PX)
         .show(|ui| {
+            ui.set_min_width(KEY_PICKER_POPUP_WIDTH_PX);
+            ui.set_max_width(KEY_PICKER_POPUP_WIDTH_PX);
+
             let mut state = ui
                 .ctx()
                 .data_mut(|data| data.get_temp::<KeyPickerPopupState>(state_id))
@@ -156,11 +173,10 @@ fn render_key_picker_popup_contents(
     popup_state: &mut KeyPickerPopupState,
 ) -> Option<KeyCode> {
     ui.horizontal(|ui| {
-        let capture_width_px = 92.0;
-        let search_width_px = (ui.available_width() - capture_width_px - 6.0).max(120.0);
+        ui.spacing_mut().item_spacing.x = KEY_PICKER_HEADER_GAP_PX;
         let search_response = ui.add(
             TextEdit::singleline(&mut popup_state.search_query)
-                .desired_width(search_width_px)
+                .desired_width(KEY_PICKER_SEARCH_WIDTH_PX)
                 .hint_text("Search key..."),
         );
         if popup_state.should_focus_search {
@@ -184,7 +200,7 @@ fn render_key_picker_popup_contents(
             .fill(fill)
             .stroke(Stroke::new(1.0, border))
             .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-            .min_size(vec2(capture_width_px, 24.0));
+            .min_size(vec2(KEY_PICKER_CAPTURE_WIDTH_PX, KEYCAP_HEIGHT_PX));
         if ui.add(capture_button).clicked() {
             popup_state.is_capturing_key = !popup_state.is_capturing_key;
             if popup_state.is_capturing_key {
@@ -206,9 +222,15 @@ fn render_key_picker_popup_contents(
     let query = popup_state.search_query.trim().to_ascii_lowercase();
     let mut picked_key = None;
     ScrollArea::vertical()
+        .max_width(KEY_PICKER_POPUP_WIDTH_PX)
         .max_height(KEY_PICKER_SCROLL_HEIGHT_PX)
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            ui.set_min_width(KEY_PICKER_CONTENT_WIDTH_PX);
+            ui.set_max_width(KEY_PICKER_CONTENT_WIDTH_PX);
+            ui.spacing_mut().button_padding =
+                vec2(KEYCAP_BUTTON_PADDING_X_PX, KEYCAP_BUTTON_PADDING_Y_PX);
+            ui.spacing_mut().item_spacing = vec2(KEYCAP_GAP_PX, KEYCAP_GAP_PX);
             picked_key = if query.is_empty() {
                 render_categorized_key_grids(ui, current_key)
             } else {
@@ -244,23 +266,33 @@ fn render_filtered_key_grid(
     if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
         return matched_keys.first().copied();
     }
-    render_keycap_wrap_group(ui, current_key, &matched_keys)
+
+    let packed_rows = pack_keys_into_bounded_rows(&matched_keys, KEY_PICKER_CONTENT_WIDTH_PX);
+    for row_keys in packed_rows {
+        if let Some(selected_key) = render_variable_width_key_row(ui, current_key, &row_keys) {
+            return Some(selected_key);
+        }
+    }
+    None
 }
 
 fn render_categorized_key_grids(ui: &mut Ui, current_key: KeyCode) -> Option<KeyCode> {
     let all_keys = KeyCode::all_keys();
-    let sections: [(&str, &[KeyCode]); 6] = [
-        ("Letters", all_keys.get(0..26).unwrap_or(&[])),
-        ("Numbers", all_keys.get(26..36).unwrap_or(&[])),
-        ("Function Keys", all_keys.get(36..48).unwrap_or(&[])),
-        ("Modifiers", all_keys.get(48..57).unwrap_or(&[])),
-        ("Navigation", all_keys.get(57..75).unwrap_or(&[])),
-        ("Symbols & Numpad", all_keys.get(75..).unwrap_or(&[])),
+    let sections: [(&str, &[KeyCode], usize); 7] = [
+        ("Letters", all_keys.get(0..26).unwrap_or(&[]), 10),
+        ("Numbers", all_keys.get(26..36).unwrap_or(&[]), 10),
+        ("Function Keys", all_keys.get(36..48).unwrap_or(&[]), 6),
+        ("Modifiers", all_keys.get(48..57).unwrap_or(&[]), 4),
+        ("Navigation", all_keys.get(57..75).unwrap_or(&[]), 4),
+        ("Symbols", all_keys.get(75..86).unwrap_or(&[]), 10),
+        ("Numpad", all_keys.get(86..).unwrap_or(&[]), 4),
     ];
-    for (section_label, section_keys) in sections {
+    for (section_label, section_keys, columns_per_row) in sections {
         ui.label(rich_semibold(section_label, 11.0, TEXT_MUTED));
         ui.add_space(2.0);
-        if let Some(selected_key) = render_keycap_wrap_group(ui, current_key, section_keys) {
+        if let Some(selected_key) =
+            render_fixed_column_key_rows(ui, current_key, section_keys, columns_per_row)
+        {
             return Some(selected_key);
         }
         ui.add_space(6.0);
@@ -268,35 +300,113 @@ fn render_categorized_key_grids(ui: &mut Ui, current_key: KeyCode) -> Option<Key
     None
 }
 
-fn render_keycap_wrap_group(
+fn render_fixed_column_key_rows(
     ui: &mut Ui,
     current_key: KeyCode,
     candidate_keys: &[KeyCode],
+    columns_per_row: usize,
 ) -> Option<KeyCode> {
-    let mut selected_key = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-        for candidate in candidate_keys {
-            let (fill, border, ink) = if *candidate == current_key {
-                (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, ACCENT_PRIMARY)
-            } else {
-                (SURFACE_ELEVATED, BORDER_SUBTLE, TEXT_PRIMARY)
-            };
-            let button = Button::new(rich_mono_bold(
-                candidate.display_label(),
-                FONT_SIZE_SMALL_PX,
-                ink,
-            ))
-            .fill(fill)
-            .stroke(Stroke::new(1.0, border))
-            .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-            .min_size(vec2(30.0, 24.0));
-            if ui.add(button).clicked() {
-                selected_key = Some(*candidate);
+    let safe_columns = columns_per_row.max(1);
+    let total_gap_px = KEYCAP_GAP_PX * (safe_columns.saturating_sub(1) as f32);
+    let cell_width_px =
+        ((KEY_PICKER_CONTENT_WIDTH_PX - total_gap_px) / (safe_columns as f32)).floor();
+
+    for key_chunk in candidate_keys.chunks(safe_columns) {
+        let mut selected_in_row = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(KEYCAP_GAP_PX, KEYCAP_GAP_PX);
+            for candidate in key_chunk {
+                if render_single_keycap_button(ui, current_key, *candidate, cell_width_px) {
+                    selected_in_row = Some(*candidate);
+                }
+            }
+        });
+        if selected_in_row.is_some() {
+            return selected_in_row;
+        }
+    }
+    None
+}
+
+fn render_variable_width_key_row(
+    ui: &mut Ui,
+    current_key: KeyCode,
+    row_keys: &[KeyCode],
+) -> Option<KeyCode> {
+    let mut selected_in_row = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(KEYCAP_GAP_PX, KEYCAP_GAP_PX);
+        for candidate in row_keys {
+            let button_width_px = estimate_keycap_width_px(*candidate);
+            if render_single_keycap_button(ui, current_key, *candidate, button_width_px) {
+                selected_in_row = Some(*candidate);
             }
         }
     });
-    selected_key
+    selected_in_row
+}
+
+fn render_single_keycap_button(
+    ui: &mut Ui,
+    current_key: KeyCode,
+    candidate_key: KeyCode,
+    min_width_px: f32,
+) -> bool {
+    let (fill, border, ink) = if candidate_key == current_key {
+        (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, ACCENT_PRIMARY)
+    } else {
+        (SURFACE_ELEVATED, BORDER_SUBTLE, TEXT_PRIMARY)
+    };
+    let button = Button::new(rich_mono_bold(
+        candidate_key.display_label(),
+        FONT_SIZE_SMALL_PX,
+        ink,
+    ))
+    .fill(fill)
+    .stroke(Stroke::new(1.0, border))
+    .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
+    .min_size(vec2(min_width_px, KEYCAP_HEIGHT_PX));
+    ui.add(button).clicked()
+}
+
+fn estimate_keycap_width_px(key_code: KeyCode) -> f32 {
+    let char_count = key_code.display_label().chars().count() as f32;
+    (char_count * ESTIMATED_MONO_CHAR_WIDTH_PX + ESTIMATED_KEYCAP_CHROME_PX)
+        .max(KEYCAP_MIN_WIDTH_PX)
+        .ceil()
+}
+
+fn pack_keys_into_bounded_rows(
+    candidate_keys: &[KeyCode],
+    max_row_width_px: f32,
+) -> Vec<Vec<KeyCode>> {
+    let mut rows: Vec<Vec<KeyCode>> = Vec::new();
+    let mut current_row: Vec<KeyCode> = Vec::new();
+    let mut current_row_width_px: f32 = 0.0;
+
+    for candidate in candidate_keys {
+        let key_width_px = estimate_keycap_width_px(*candidate);
+        let gap_px = if current_row.is_empty() {
+            0.0
+        } else {
+            KEYCAP_GAP_PX
+        };
+        if !current_row.is_empty()
+            && current_row_width_px + gap_px + key_width_px > max_row_width_px
+        {
+            rows.push(current_row);
+            current_row = vec![*candidate];
+            current_row_width_px = key_width_px;
+            continue;
+        }
+        current_row.push(*candidate);
+        current_row_width_px += gap_px + key_width_px;
+    }
+
+    if !current_row.is_empty() {
+        rows.push(current_row);
+    }
+    rows
 }
 
 fn detect_popup_key_press(ui: &Ui) -> Option<KeyCode> {
@@ -318,4 +428,32 @@ fn detect_popup_key_press(ui: &Ui) -> Option<KeyCode> {
         }
         None
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_key_rows_stay_within_fixed_popup_content_width() {
+        let packed_rows =
+            pack_keys_into_bounded_rows(KeyCode::all_keys(), KEY_PICKER_CONTENT_WIDTH_PX);
+        assert!(!packed_rows.is_empty());
+
+        let mut total_packed_keys: usize = 0;
+        for row_keys in packed_rows {
+            total_packed_keys = total_packed_keys.saturating_add(row_keys.len());
+            let total_gaps_px = KEYCAP_GAP_PX * (row_keys.len().saturating_sub(1) as f32);
+            let total_width_px: f32 = row_keys
+                .iter()
+                .map(|key_code| estimate_keycap_width_px(*key_code))
+                .sum::<f32>()
+                + total_gaps_px;
+            assert!(
+                total_width_px <= KEY_PICKER_CONTENT_WIDTH_PX,
+                "row exceeded fixed popup content width: {total_width_px} > {KEY_PICKER_CONTENT_WIDTH_PX}"
+            );
+        }
+        assert_eq!(total_packed_keys, KeyCode::all_keys().len());
+    }
 }

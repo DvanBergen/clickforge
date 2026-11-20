@@ -88,6 +88,7 @@ impl InputSink for MockInputSink {
 struct MockPhysicalInput {
     is_left_mouse_held: AtomicBool,
     is_space_held: AtomicBool,
+    is_left_shift_held: AtomicBool,
 }
 
 impl PhysicalInputReader for MockPhysicalInput {
@@ -96,7 +97,11 @@ impl PhysicalInputReader for MockPhysicalInput {
     }
 
     fn is_key_pressed(&self, key_code: KeyCode) -> bool {
-        key_code == KeyCode::Space && self.is_space_held.load(Ordering::SeqCst)
+        match key_code {
+            KeyCode::Space => self.is_space_held.load(Ordering::SeqCst),
+            KeyCode::LeftShift => self.is_left_shift_held.load(Ordering::SeqCst),
+            _ => false,
+        }
     }
 }
 
@@ -180,6 +185,7 @@ fn executes_variables_repeat_branching_type_text_and_stops_cleanly() -> Result<(
 fn while_input_held_aborts_immediately_and_releases_inputs() -> Result<(), String> {
     let mut program = VisualProgram::new(TriggerBlock::WhileInputHeld {
         trigger_input: InputTrigger::Mouse(MouseButton::Left),
+        additional_held_inputs: Vec::new(),
     });
     program.append_root_block(StatementKind::WaitRandomGaussian {
         base_delay_ms: 5,
@@ -234,6 +240,7 @@ fn while_input_held_aborts_immediately_and_releases_inputs() -> Result<(), Strin
 fn on_input_pressed_fires_once_per_rising_edge_and_break_loop_exits_repeat() -> Result<(), String> {
     let mut program = VisualProgram::new(TriggerBlock::OnInputPressed {
         trigger_input: InputTrigger::Key(KeyCode::Space),
+        additional_held_inputs: Vec::new(),
     });
     let click_block = program.create_block(StatementKind::MouseClick {
         mouse_button: MouseButton::Right,
@@ -287,4 +294,145 @@ fn variable_map_enforces_maximum_variable_cap() {
     let result =
         execute_visual_program(&program, mock_sink, mock_physical, &abort_flag, &mut hooks);
     assert!(result.is_err());
+}
+
+#[test]
+fn while_input_held_chord_fires_only_when_primary_and_additional_inputs_are_pressed()
+-> Result<(), String> {
+    let mut program = VisualProgram::new(TriggerBlock::WhileInputHeld {
+        trigger_input: InputTrigger::Mouse(MouseButton::Left),
+        additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
+    });
+    program.append_root_block(StatementKind::WaitFixed { delay_ms: 4 });
+    program.append_root_block(StatementKind::MouseClick {
+        mouse_button: MouseButton::Left,
+        hold_duration_ms: 1,
+    });
+
+    let mock_sink = Arc::new(MockInputSink::default());
+    let mock_physical = Arc::new(MockPhysicalInput::default());
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let worker_abort = Arc::clone(&abort_flag);
+    let worker_sink = Arc::clone(&mock_sink);
+    let worker_physical = Arc::clone(&mock_physical);
+
+    let handle = std::thread::spawn(move || {
+        let mut hooks = BlockExecutionHooks::default();
+        execute_visual_program(
+            &program,
+            worker_sink,
+            worker_physical,
+            &worker_abort,
+            &mut hooks,
+        )
+    });
+
+    // Primary only: must not fire.
+    mock_physical
+        .is_left_mouse_held
+        .store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        !mock_sink
+            .snapshot_events()
+            .contains(&RecordedEvent::MouseDown(MouseButton::Left))
+    );
+
+    // Additional only: must not fire.
+    mock_physical
+        .is_left_mouse_held
+        .store(false, Ordering::SeqCst);
+    mock_physical
+        .is_left_shift_held
+        .store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        !mock_sink
+            .snapshot_events()
+            .contains(&RecordedEvent::MouseDown(MouseButton::Left))
+    );
+
+    // Both held simultaneously: clicks must fire.
+    mock_physical
+        .is_left_mouse_held
+        .store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(45));
+    abort_flag.store(true, Ordering::SeqCst);
+
+    let stop_reason = match handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err("chord interpreter test thread panicked".to_string()),
+    };
+    assert_eq!(stop_reason, ProgramStopReason::Aborted);
+    assert!(
+        mock_sink
+            .snapshot_events()
+            .contains(&RecordedEvent::MouseDown(MouseButton::Left))
+    );
+    Ok(())
+}
+
+#[test]
+fn if_then_else_with_do_nothing_branch_executes_without_emitting_actions() -> Result<(), String> {
+    let mut program = VisualProgram::new(TriggerBlock::LoopWhileActive);
+    program.append_root_block(StatementKind::SetVariable {
+        variable_name: "skip_click".to_string(),
+        value: 1.0,
+    });
+    let noop_block = program.create_block(StatementKind::DoNothing);
+    let noop_block_id = noop_block.id;
+    let fallback_click = program.create_block(StatementKind::MouseClick {
+        mouse_button: MouseButton::Left,
+        hold_duration_ms: 1,
+    });
+    program.append_root_block(StatementKind::IfThenElse {
+        condition: ConditionExpr::CompareVariable {
+            variable_name: "skip_click".to_string(),
+            operator: ComparisonOperator::Equal,
+            target_value: 1.0,
+        },
+        then_blocks: vec![noop_block],
+        else_blocks: vec![fallback_click],
+    });
+    program.append_root_block(StatementKind::StopScript);
+
+    let mock_sink = Arc::new(MockInputSink::default());
+    let mock_physical = Arc::new(MockPhysicalInput::default());
+    let abort_flag = AtomicBool::new(false);
+    let visited_block_ids = Arc::new(Mutex::new(Vec::<BlockId>::new()));
+    let hook_visited = Arc::clone(&visited_block_ids);
+    let action_count = Arc::new(AtomicU64::new(0));
+    let hook_actions = Arc::clone(&action_count);
+
+    let mut hooks = BlockExecutionHooks {
+        on_active_block_changed: Some(Box::new(move |maybe_block_id| {
+            if let Some(block_id) = maybe_block_id
+                && let Ok(mut guard) = hook_visited.lock()
+            {
+                guard.push(block_id);
+            }
+        })),
+        on_delay_sampled_ms: None,
+        on_action_executed: Some(Box::new(move || {
+            hook_actions.fetch_add(1, Ordering::SeqCst);
+        })),
+    };
+
+    let stop_reason = execute_visual_program(
+        &program,
+        Arc::clone(&mock_sink) as Arc<dyn InputSink>,
+        mock_physical,
+        &abort_flag,
+        &mut hooks,
+    )?;
+
+    assert_eq!(stop_reason, ProgramStopReason::StoppedByBlock);
+    assert_eq!(action_count.load(Ordering::SeqCst), 0);
+    assert_eq!(mock_sink.snapshot_events(), vec![RecordedEvent::ReleaseAll]);
+    let visited = visited_block_ids
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    assert!(visited.contains(&noop_block_id));
+    Ok(())
 }

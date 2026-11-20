@@ -95,6 +95,7 @@ fn build_focus_gated_game_script() -> ScriptDocument {
     });
     game_script.visual_program = VisualProgram::new(TriggerBlock::WhileInputHeld {
         trigger_input: InputTrigger::Mouse(MouseButton::Left),
+        additional_held_inputs: Vec::new(),
     });
     game_script
         .visual_program
@@ -447,6 +448,7 @@ fn failed_trigger_intercept_logs_warning_once_without_tick_spam() -> Result<(), 
 
     game_script.visual_program.trigger = TriggerBlock::WhileInputHeld {
         trigger_input: InputTrigger::Mouse(MouseButton::Right),
+        additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
     };
     handle.send_command(CoordinatorCommand::UpsertScript(game_script.clone()))?;
     assert!(wait_until_condition(|| {
@@ -458,9 +460,10 @@ fn failed_trigger_intercept_logs_warning_once_without_tick_spam() -> Result<(), 
     assert_eq!(count_intercept_failure_warnings(&handle.snapshot()), 3);
     assert_eq!(
         failing_intercept.last_attempted(),
-        Some(TriggerInterceptSpec {
-            trigger_input: InputTrigger::Mouse(MouseButton::Right),
-        })
+        Some(TriggerInterceptSpec::new(
+            InputTrigger::Mouse(MouseButton::Right),
+            &[InputTrigger::Key(KeyCode::LeftShift)],
+        ))
     );
 
     failing_intercept.set_should_fail(false);

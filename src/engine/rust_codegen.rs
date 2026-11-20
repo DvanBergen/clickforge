@@ -81,9 +81,12 @@ fn emit_imports(feature_flags: &ProgramFeatureFlags, output_lines: &mut Vec<Stri
 fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
     let body_has_wait = slice_contains_wait_action(&program.statements);
 
-    match program.trigger {
-        TriggerBlock::WhileInputHeld { trigger_input } => {
-            let input_expr = format_input_pressed_expr(trigger_input);
+    match &program.trigger {
+        TriggerBlock::WhileInputHeld {
+            trigger_input,
+            additional_held_inputs,
+        } => {
+            let input_expr = format_chord_pressed_expr(*trigger_input, additional_held_inputs);
             output_lines.push("    while !script_context.should_stop() {".to_string());
             output_lines.push(format!("        if {input_expr} {{"));
             emit_statement_slice(&program.statements, 3, output_lines);
@@ -100,8 +103,11 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
             output_lines.push("        }".to_string());
             output_lines.push("    }".to_string());
         }
-        TriggerBlock::OnInputToggle { trigger_input } => {
-            let input_expr = format_input_pressed_expr(trigger_input);
+        TriggerBlock::OnInputToggle {
+            trigger_input,
+            additional_held_inputs,
+        } => {
+            let input_expr = format_chord_pressed_expr(*trigger_input, additional_held_inputs);
             output_lines.push("    let mut is_toggle_active = false;".to_string());
             output_lines.push("    let mut was_trigger_pressed = false;".to_string());
             output_lines.push("    while !script_context.should_stop() {".to_string());
@@ -126,8 +132,11 @@ fn emit_trigger_body(program: &VisualProgram, output_lines: &mut Vec<String>) {
             output_lines.push("        }".to_string());
             output_lines.push("    }".to_string());
         }
-        TriggerBlock::OnInputPressed { trigger_input } => {
-            let input_expr = format_input_pressed_expr(trigger_input);
+        TriggerBlock::OnInputPressed {
+            trigger_input,
+            additional_held_inputs,
+        } => {
+            let input_expr = format_chord_pressed_expr(*trigger_input, additional_held_inputs);
             output_lines.push("    let mut was_trigger_pressed = false;".to_string());
             output_lines.push("    while !script_context.should_stop() {".to_string());
             output_lines.push(format!("        let is_trigger_pressed = {input_expr};"));
@@ -231,6 +240,9 @@ fn emit_single_statement(
         }
         StatementKind::BreakLoop => output_lines.push(format!("{prefix}break;")),
         StatementKind::StopScript => output_lines.push(format!("{prefix}return Ok(());")),
+        StatementKind::DoNothing => {
+            output_lines.push(format!("{prefix}// Do nothing (explicit no-op block)"));
+        }
         StatementKind::MouseClick {
             mouse_button,
             hold_duration_ms,
@@ -344,6 +356,18 @@ fn emit_gaussian_wait_lines(
     }
 }
 
+fn format_chord_pressed_expr(
+    trigger_input: InputTrigger,
+    additional_held_inputs: &[InputTrigger],
+) -> String {
+    let mut expressions = Vec::with_capacity(1_usize.saturating_add(additional_held_inputs.len()));
+    expressions.push(format_input_pressed_expr(trigger_input));
+    for required_input in additional_held_inputs {
+        expressions.push(format_input_pressed_expr(*required_input));
+    }
+    expressions.join(" && ")
+}
+
 fn format_input_pressed_expr(trigger: InputTrigger) -> String {
     match trigger {
         InputTrigger::Mouse(mouse_button) => {
@@ -414,7 +438,7 @@ fn format_condition_expr(condition: &ConditionExpr) -> String {
 
 fn inspect_program_features(program: &VisualProgram) -> ProgramFeatureFlags {
     let mut flags = ProgramFeatureFlags::default();
-    if let Some(trigger_input) = program.trigger.trigger_input() {
+    for trigger_input in program.trigger.all_trigger_inputs() {
         record_trigger_feature(trigger_input, &mut flags);
     }
     inspect_statement_slice_features(&program.statements, &mut flags);
@@ -466,6 +490,7 @@ fn inspect_statement_slice_features(
             }
             StatementKind::BreakLoop
             | StatementKind::StopScript
+            | StatementKind::DoNothing
             | StatementKind::MouseMoveRelative { .. }
             | StatementKind::MouseScroll { .. }
             | StatementKind::TypeText { .. }
@@ -590,6 +615,7 @@ mod tests {
         let mut script = ScriptDocument::new_building_upgrade_template();
         script.visual_program = VisualProgram::new(TriggerBlock::OnInputToggle {
             trigger_input: InputTrigger::Key(KeyCode::F7),
+            additional_held_inputs: Vec::new(),
         });
         script
             .visual_program
@@ -624,5 +650,40 @@ mod tests {
         assert!(generated_source.contains("KeyCode::F7"));
         assert!(generated_source.contains("KeyCode::E"));
         assert!(!generated_source.contains(".unwrap()"));
+    }
+
+    #[test]
+    fn generates_chord_trigger_conditions_and_do_nothing_comment() {
+        let mut script = ScriptDocument::new_building_upgrade_template();
+        script.visual_program = VisualProgram::new(TriggerBlock::WhileInputHeld {
+            trigger_input: InputTrigger::Mouse(clickforge_sdk::MouseButton::Left),
+            additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
+        });
+        let noop_block = script.visual_program.create_block(StatementKind::DoNothing);
+        let click_block = script
+            .visual_program
+            .create_block(StatementKind::MouseClick {
+                mouse_button: clickforge_sdk::MouseButton::Left,
+                hold_duration_ms: 12,
+            });
+        script
+            .visual_program
+            .append_root_block(StatementKind::IfThenElse {
+                condition: ConditionExpr::RandomChance {
+                    chance_percent: 25.0,
+                },
+                then_blocks: vec![noop_block],
+                else_blocks: vec![click_block],
+            });
+
+        let generated_source = generate_rust_source_from_script(&script);
+        assert!(generated_source.contains("KeyCode"));
+        assert!(generated_source.contains("MouseButton"));
+        assert!(generated_source.contains(
+            "script_context.is_mouse_pressed(MouseButton::Left)? && script_context.is_key_pressed(KeyCode::LeftShift)?"
+        ));
+        assert!(generated_source.contains("// Do nothing (explicit no-op block)"));
+        assert!(!generated_source.contains(".unwrap()"));
+        assert!(!generated_source.contains(".expect("));
     }
 }

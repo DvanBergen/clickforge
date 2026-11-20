@@ -571,7 +571,12 @@ impl CoordinatorLoop {
             .intercept_trigger_input
             .then(|| script.effective_trigger_input())
             .flatten()
-            .map(|trigger_input| TriggerInterceptSpec { trigger_input })
+            .map(|trigger_input| {
+                TriggerInterceptSpec::new(
+                    trigger_input,
+                    script.visual_program.trigger.additional_held_inputs(),
+                )
+            })
     }
 
     fn ensure_script_worker_running(

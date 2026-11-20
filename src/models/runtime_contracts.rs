@@ -63,10 +63,46 @@ pub trait PhysicalInputReader: Send + Sync {
     }
 }
 
+/// Maximum number of additional chord inputs evaluated during lock-free trigger interception.
+pub const MAX_INTERCEPT_REQUIRED_INPUTS: usize = 4;
+
 /// Active trigger interception configuration for optional `EVIOCGRAB` suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TriggerInterceptSpec {
     pub trigger_input: InputTrigger,
+    pub required_held_inputs: [Option<InputTrigger>; MAX_INTERCEPT_REQUIRED_INPUTS],
+}
+
+impl TriggerInterceptSpec {
+    /// Builds a lock-free intercept specification from the primary trigger and chord inputs.
+    pub fn new(trigger_input: InputTrigger, additional_inputs: &[InputTrigger]) -> Self {
+        let mut required_held_inputs = [None; MAX_INTERCEPT_REQUIRED_INPUTS];
+        let mut slot_index: usize = 0;
+
+        for candidate_input in additional_inputs {
+            if slot_index >= MAX_INTERCEPT_REQUIRED_INPUTS {
+                break;
+            }
+            if *candidate_input == trigger_input {
+                continue;
+            }
+            if required_held_inputs[..slot_index].contains(&Some(*candidate_input)) {
+                continue;
+            }
+            required_held_inputs[slot_index] = Some(*candidate_input);
+            slot_index = slot_index.saturating_add(1);
+        }
+
+        Self {
+            trigger_input,
+            required_held_inputs,
+        }
+    }
+
+    /// Iterates over every distinct additional chord input that must be held for suppression.
+    pub fn required_inputs_iter(&self) -> impl Iterator<Item = InputTrigger> + '_ {
+        self.required_held_inputs.iter().copied().flatten()
+    }
 }
 
 /// Control surface used by the coordinator to toggle safe `EVIOCGRAB` trigger interception.

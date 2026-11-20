@@ -6,7 +6,9 @@ use clickforge_sdk::InputTrigger;
 use evdev::{EventSummary, InputEvent, KeyCode as EvdevKeyCode, SynchronizationCode};
 
 use crate::linux::evdev_keymap::{evdev_to_trigger, trigger_to_evdev};
-use crate::models::runtime_contracts::{InputError, TriggerInterceptControl, TriggerInterceptSpec};
+use crate::models::runtime_contracts::{
+    InputError, PhysicalInputReader, TriggerInterceptControl, TriggerInterceptSpec,
+};
 
 const GRAB_SYNC_ACK_TIMEOUT_MS: u64 = 120;
 const KEY_STATE_RELEASED: i32 = 0;
@@ -197,14 +199,21 @@ impl Drop for TriggerInterceptor {
 /// Classifies a single `evdev` event received from a grabbed physical pointer device.
 pub fn classify_grabbed_pointer_event(
     input_event: InputEvent,
-    suppressed_trigger: InputTrigger,
+    intercept_spec: TriggerInterceptSpec,
+    physical_input: &dyn PhysicalInputReader,
+    is_suppressed_trigger_held: &mut bool,
 ) -> GrabbedEventDecision {
-    let suppressed_evdev_code: EvdevKeyCode = trigger_to_evdev(suppressed_trigger);
+    let suppressed_evdev_code: EvdevKeyCode = trigger_to_evdev(intercept_spec.trigger_input);
 
     match input_event.destructure() {
         EventSummary::Key(_, evdev_code, event_value) => {
             if evdev_code == suppressed_evdev_code {
-                return classify_suppressed_key_value(suppressed_trigger, event_value);
+                return classify_trigger_key_value(
+                    intercept_spec,
+                    event_value,
+                    physical_input,
+                    is_suppressed_trigger_held,
+                );
             }
             let mapped_transition = map_key_transition_if_press_or_release(evdev_code, event_value);
             GrabbedEventDecision::ForwardEvent { mapped_transition }
@@ -219,20 +228,38 @@ pub fn classify_grabbed_pointer_event(
     }
 }
 
-fn classify_suppressed_key_value(
-    suppressed_trigger: InputTrigger,
+fn classify_trigger_key_value(
+    intercept_spec: TriggerInterceptSpec,
     event_value: i32,
+    physical_input: &dyn PhysicalInputReader,
+    is_suppressed_trigger_held: &mut bool,
 ) -> GrabbedEventDecision {
     if event_value == KEY_STATE_PRESSED {
-        return GrabbedEventDecision::SuppressTrigger {
-            trigger: suppressed_trigger,
-            is_pressed: true,
+        let are_required_inputs_held = intercept_spec
+            .required_inputs_iter()
+            .all(|required_input| physical_input.is_trigger_pressed(required_input));
+        if are_required_inputs_held {
+            *is_suppressed_trigger_held = true;
+            return GrabbedEventDecision::SuppressTrigger {
+                trigger: intercept_spec.trigger_input,
+                is_pressed: true,
+            };
+        }
+        *is_suppressed_trigger_held = false;
+        return GrabbedEventDecision::ForwardEvent {
+            mapped_transition: Some((intercept_spec.trigger_input, true)),
         };
     }
     if event_value == KEY_STATE_RELEASED {
-        return GrabbedEventDecision::SuppressTrigger {
-            trigger: suppressed_trigger,
-            is_pressed: false,
+        if *is_suppressed_trigger_held {
+            *is_suppressed_trigger_held = false;
+            return GrabbedEventDecision::SuppressTrigger {
+                trigger: intercept_spec.trigger_input,
+                is_pressed: false,
+            };
+        }
+        return GrabbedEventDecision::ForwardEvent {
+            mapped_transition: Some((intercept_spec.trigger_input, false)),
         };
     }
     GrabbedEventDecision::Ignore
@@ -256,13 +283,30 @@ mod tests {
     use clickforge_sdk::{KeyCode, MouseButton};
     use evdev::{KeyEvent, RelativeAxisCode, RelativeAxisEvent, SynchronizationEvent};
 
+    #[derive(Default)]
+    struct MockChordPhysicalInput {
+        is_left_shift_held: bool,
+        is_right_mouse_held: bool,
+    }
+
+    impl PhysicalInputReader for MockChordPhysicalInput {
+        fn is_mouse_pressed(&self, mouse_button: MouseButton) -> bool {
+            mouse_button == MouseButton::Right && self.is_right_mouse_held
+        }
+
+        fn is_key_pressed(&self, key_code: KeyCode) -> bool {
+            key_code == KeyCode::LeftShift && self.is_left_shift_held
+        }
+    }
+
     #[test]
     fn refuses_intercept_when_uinput_is_unavailable() {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let interceptor = TriggerInterceptor::new(false, shutdown_flag);
-        let result = interceptor.set_intercept(Some(TriggerInterceptSpec {
-            trigger_input: InputTrigger::Mouse(MouseButton::Left),
-        }));
+        let result = interceptor.set_intercept(Some(TriggerInterceptSpec::new(
+            InputTrigger::Mouse(MouseButton::Left),
+            &[],
+        )));
         assert!(result.is_err());
         assert!(!interceptor.is_intercept_active());
     }
@@ -272,9 +316,10 @@ mod tests {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let interceptor = TriggerInterceptor::new(true, shutdown_flag);
         interceptor.report_applied_state(None, 1, None);
-        let result = interceptor.set_intercept(Some(TriggerInterceptSpec {
-            trigger_input: InputTrigger::Key(KeyCode::F6),
-        }));
+        let result = interceptor.set_intercept(Some(TriggerInterceptSpec::new(
+            InputTrigger::Key(KeyCode::F6),
+            &[],
+        )));
         assert!(result.is_ok());
         assert!(!interceptor.is_intercept_active());
         assert_eq!(interceptor.active_intercept(), None);
@@ -283,19 +328,48 @@ mod tests {
     #[test]
     fn grabbed_pointer_event_classifier_suppresses_trigger_and_forwards_motion_and_other_buttons() {
         let suppressed_trigger = InputTrigger::Mouse(MouseButton::Left);
+        let intercept_spec = TriggerInterceptSpec::new(suppressed_trigger, &[]);
+        let physical_input = MockChordPhysicalInput::default();
+        let mut is_suppressed_trigger_held = false;
 
         let left_down = *KeyEvent::new(EvdevKeyCode::BTN_LEFT, KEY_STATE_PRESSED);
         assert_eq!(
-            classify_grabbed_pointer_event(left_down, suppressed_trigger),
+            classify_grabbed_pointer_event(
+                left_down,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
             GrabbedEventDecision::SuppressTrigger {
                 trigger: suppressed_trigger,
                 is_pressed: true,
             }
         );
+        assert!(is_suppressed_trigger_held);
+
+        let left_up = *KeyEvent::new(EvdevKeyCode::BTN_LEFT, KEY_STATE_RELEASED);
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_up,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::SuppressTrigger {
+                trigger: suppressed_trigger,
+                is_pressed: false,
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
 
         let right_down = *KeyEvent::new(EvdevKeyCode::BTN_RIGHT, KEY_STATE_PRESSED);
         assert_eq!(
-            classify_grabbed_pointer_event(right_down, suppressed_trigger),
+            classify_grabbed_pointer_event(
+                right_down,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
             GrabbedEventDecision::ForwardEvent {
                 mapped_transition: Some((InputTrigger::Mouse(MouseButton::Right), true)),
             }
@@ -303,7 +377,12 @@ mod tests {
 
         let motion_x = *RelativeAxisEvent::new(RelativeAxisCode::REL_X, 14);
         assert_eq!(
-            classify_grabbed_pointer_event(motion_x, suppressed_trigger),
+            classify_grabbed_pointer_event(
+                motion_x,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
             GrabbedEventDecision::ForwardEvent {
                 mapped_transition: None,
             }
@@ -311,7 +390,12 @@ mod tests {
 
         let wheel = *RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL, -1);
         assert_eq!(
-            classify_grabbed_pointer_event(wheel, suppressed_trigger),
+            classify_grabbed_pointer_event(
+                wheel,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
             GrabbedEventDecision::ForwardEvent {
                 mapped_transition: None,
             }
@@ -319,8 +403,112 @@ mod tests {
 
         let syn_report = *SynchronizationEvent::new(SynchronizationCode::SYN_REPORT, 0);
         assert_eq!(
-            classify_grabbed_pointer_event(syn_report, suppressed_trigger),
+            classify_grabbed_pointer_event(
+                syn_report,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
             GrabbedEventDecision::FlushForwardedFrame
         );
+    }
+
+    #[test]
+    fn chord_aware_classifier_forwards_without_modifier_and_suppresses_matched_release_after_early_modifier_up()
+     {
+        let primary_trigger = InputTrigger::Mouse(MouseButton::Left);
+        let intercept_spec =
+            TriggerInterceptSpec::new(primary_trigger, &[InputTrigger::Key(KeyCode::LeftShift)]);
+        let mut physical_input = MockChordPhysicalInput::default();
+        let mut is_suppressed_trigger_held = false;
+
+        let left_down = *KeyEvent::new(EvdevKeyCode::BTN_LEFT, KEY_STATE_PRESSED);
+        let left_up = *KeyEvent::new(EvdevKeyCode::BTN_LEFT, KEY_STATE_RELEASED);
+
+        // Without Left Shift held, normal clicking passes straight through to uinput.
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_down,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::ForwardEvent {
+                mapped_transition: Some((primary_trigger, true)),
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_up,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::ForwardEvent {
+                mapped_transition: Some((primary_trigger, false)),
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
+
+        // With Left Shift held, Left Mouse down is suppressed.
+        physical_input.is_left_shift_held = true;
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_down,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::SuppressTrigger {
+                trigger: primary_trigger,
+                is_pressed: true,
+            }
+        );
+        assert!(is_suppressed_trigger_held);
+
+        // Releasing Left Shift mid-hold must still suppress the matching Left Mouse release.
+        physical_input.is_left_shift_held = false;
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_up,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::SuppressTrigger {
+                trigger: primary_trigger,
+                is_pressed: false,
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
+
+        // Pressing Left Shift mid-hold after a forwarded Left Mouse press must still forward the release.
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_down,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::ForwardEvent {
+                mapped_transition: Some((primary_trigger, true)),
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
+
+        physical_input.is_left_shift_held = true;
+        assert_eq!(
+            classify_grabbed_pointer_event(
+                left_up,
+                intercept_spec,
+                &physical_input,
+                &mut is_suppressed_trigger_held,
+            ),
+            GrabbedEventDecision::ForwardEvent {
+                mapped_transition: Some((primary_trigger, false)),
+            }
+        );
+        assert!(!is_suppressed_trigger_held);
     }
 }

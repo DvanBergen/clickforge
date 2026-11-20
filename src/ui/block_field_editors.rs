@@ -142,6 +142,11 @@ pub(crate) fn render_leaf_block_sentence(
             render_lead_verb(ui, "Stop Script", visual_colors);
             false
         }
+        StatementKind::DoNothing => {
+            render_lead_verb(ui, "Do Nothing", visual_colors);
+            render_muted_word(ui, "(no action)", visual_colors);
+            false
+        }
         StatementKind::MouseClick {
             mouse_button,
             hold_duration_ms,

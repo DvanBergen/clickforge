@@ -78,6 +78,7 @@ impl ScriptDocument {
             intercept_trigger_input: false,
             visual_program: VisualProgram::new(TriggerBlock::WhileInputHeld {
                 trigger_input: InputTrigger::Mouse(MouseButton::Left),
+                additional_held_inputs: Vec::new(),
             }),
             rust_source: Self::default_rust_starter_source(),
             created_at_unix_ms: now_unix_ms,
@@ -90,6 +91,7 @@ impl ScriptDocument {
         let now_unix_ms = Self::current_unix_timestamp_ms();
         let mut visual_program = VisualProgram::new(TriggerBlock::WhileInputHeld {
             trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: Vec::new(),
         });
         visual_program.append_root_block(StatementKind::WaitRandomGaussian {
             base_delay_ms: 45,

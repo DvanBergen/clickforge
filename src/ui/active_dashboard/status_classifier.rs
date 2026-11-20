@@ -466,18 +466,7 @@ fn build_armed_explanation(
     is_uinput_ready: bool,
 ) -> String {
     let trigger_instruction = match script.mode {
-        ScriptMode::VisualBlocks => match &script.visual_program.trigger {
-            TriggerBlock::WhileInputHeld { trigger_input } => {
-                format!("Hold {} to fire", trigger_input.display_label())
-            }
-            TriggerBlock::OnInputToggle { trigger_input } => {
-                format!("Press {} to toggle firing", trigger_input.display_label())
-            }
-            TriggerBlock::OnInputPressed { trigger_input } => {
-                format!("Press {} to run once", trigger_input.display_label())
-            }
-            TriggerBlock::LoopWhileActive => "Looping continuously while focused".to_string(),
-        },
+        ScriptMode::VisualBlocks => describe_trigger_action(&script.visual_program.trigger),
         ScriptMode::AdvancedRust => "Advanced Rust worker active and awaiting input".to_string(),
     };
 
@@ -492,6 +481,16 @@ fn build_armed_explanation(
     };
 
     format!("Ready: {trigger_instruction}{intercept_note}")
+}
+
+fn describe_trigger_action(trigger: &TriggerBlock) -> String {
+    let chord_label = trigger.chord_display_label().unwrap_or_default();
+    match trigger {
+        TriggerBlock::WhileInputHeld { .. } => format!("Hold {chord_label} to fire"),
+        TriggerBlock::OnInputToggle { .. } => format!("Press {chord_label} to toggle firing"),
+        TriggerBlock::OnInputPressed { .. } => format!("Press {chord_label} to run once"),
+        TriggerBlock::LoopWhileActive => "Looping continuously while focused".to_string(),
+    }
 }
 
 fn resolve_target_display_name(script: &ScriptDocument) -> &str {
@@ -576,6 +575,17 @@ mod tests {
         assert_eq!(armed_info.card_label, "ARMED & READY");
         assert_eq!(armed_info.compact_label, "ARMED");
         assert!(armed_info.explanation.contains("Intercept ON"));
+
+        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
+            trigger_input: clickforge_sdk::InputTrigger::Mouse(clickforge_sdk::MouseButton::Left),
+            additional_held_inputs: vec![clickforge_sdk::InputTrigger::Key(KeyCode::LeftShift)],
+        };
+        let chord_armed_info = classify_script_live_status(&script, &validation, &armed_snapshot);
+        assert!(
+            chord_armed_info
+                .explanation
+                .contains("Hold Left Mouse + Left Shift to fire")
+        );
 
         let mut disarmed_status = ScriptRuntimeStatus::disabled(&script.id);
         disarmed_status.phase = ScriptExecutionPhase::Disabled;

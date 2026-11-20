@@ -247,6 +247,7 @@ impl MonitoredDevicePool {
             );
             self.devices.push(new_device);
         }
+        self.devices.sort_by_key(|monitored| monitored.is_pointer);
     }
 }
 
@@ -265,8 +266,9 @@ pub fn start_evdev_listener(
 ) -> (EvdevListenerStatus, Receiver<(InputTrigger, bool)>) {
     let (event_sender, event_receiver) = mpsc::sync_channel(INPUT_EVENT_CHANNEL_CAPACITY);
     let empty_existing_paths = HashSet::new();
-    let (initial_devices, permission_denied_count) =
+    let (mut initial_devices, permission_denied_count) =
         discover_physical_input_devices(&empty_existing_paths);
+    initial_devices.sort_by_key(|monitored| monitored.is_pointer);
 
     let monitored_device_count = initial_devices.len();
     let is_evdev_ready = monitored_device_count > 0;
@@ -317,6 +319,7 @@ fn run_evdev_event_loop(
 ) {
     let mut active_intercept_spec: Option<TriggerInterceptSpec> = None;
     let mut deferred_intercept_spec: Option<(TriggerInterceptSpec, u64)> = None;
+    let mut is_suppressed_trigger_held = false;
     let mut last_applied_generation: u64 = 0;
     let rescan_interval = Duration::from_millis(DEVICE_RESCAN_INTERVAL_MS);
     let mut last_rescan = Instant::now();
@@ -330,6 +333,7 @@ fn run_evdev_event_loop(
                 &trigger_interceptor,
                 &mut active_intercept_spec,
                 &mut deferred_intercept_spec,
+                &mut is_suppressed_trigger_held,
             );
         } else if let Some((pending_spec, pending_generation)) = deferred_intercept_spec
             && !device_pool.is_trigger_physically_held_on_pointer(pending_spec.trigger_input)
@@ -339,6 +343,7 @@ fn run_evdev_event_loop(
                 &mut device_pool,
                 &trigger_interceptor,
                 &mut active_intercept_spec,
+                &mut is_suppressed_trigger_held,
                 pending_spec,
                 pending_generation,
             );
@@ -357,6 +362,7 @@ fn run_evdev_event_loop(
             &shared_state,
             &trigger_interceptor,
             &mut active_intercept_spec,
+            &mut is_suppressed_trigger_held,
             &event_sender,
         );
 
@@ -379,13 +385,18 @@ fn reconcile_intercept_request(
     trigger_interceptor: &TriggerInterceptor,
     active_intercept_spec: &mut Option<TriggerInterceptSpec>,
     deferred_intercept_spec: &mut Option<(TriggerInterceptSpec, u64)>,
+    is_suppressed_trigger_held: &mut bool,
 ) {
     let (desired_spec, generation) = trigger_interceptor.desired_intercept_snapshot();
     *deferred_intercept_spec = None;
+    if desired_spec != *active_intercept_spec {
+        *is_suppressed_trigger_held = false;
+    }
 
     let Some(requested_spec) = desired_spec else {
         device_pool.release_all_grabs();
         *active_intercept_spec = None;
+        *is_suppressed_trigger_held = false;
         trigger_interceptor.report_applied_state(None, generation, None);
         return;
     };
@@ -393,6 +404,7 @@ fn reconcile_intercept_request(
     if device_pool.uinput_injector.is_none() {
         device_pool.release_all_grabs();
         *active_intercept_spec = None;
+        *is_suppressed_trigger_held = false;
         trigger_interceptor.report_applied_state(
             None,
             generation,
@@ -408,6 +420,7 @@ fn reconcile_intercept_request(
         && device_pool.is_trigger_physically_held_on_pointer(requested_spec.trigger_input)
     {
         *deferred_intercept_spec = Some((requested_spec, generation));
+        *is_suppressed_trigger_held = false;
         trigger_interceptor.report_applied_state(None, generation, None);
         return;
     }
@@ -416,6 +429,7 @@ fn reconcile_intercept_request(
         device_pool,
         trigger_interceptor,
         active_intercept_spec,
+        is_suppressed_trigger_held,
         requested_spec,
         generation,
     );
@@ -425,16 +439,23 @@ fn engage_pointer_grab(
     device_pool: &mut MonitoredDevicePool,
     trigger_interceptor: &TriggerInterceptor,
     active_intercept_spec: &mut Option<TriggerInterceptSpec>,
+    is_suppressed_trigger_held: &mut bool,
     requested_spec: TriggerInterceptSpec,
     generation: u64,
 ) {
+    let should_reset_suppressed_hold =
+        !device_pool.has_any_grabbed_pointer() || *active_intercept_spec != Some(requested_spec);
     match device_pool.try_grab_all_pointers() {
         Ok(grabbed_count) if grabbed_count > 0 => {
+            if should_reset_suppressed_hold {
+                *is_suppressed_trigger_held = false;
+            }
             *active_intercept_spec = Some(requested_spec);
             trigger_interceptor.report_applied_state(Some(requested_spec), generation, None);
         }
         Ok(_) => {
             *active_intercept_spec = None;
+            *is_suppressed_trigger_held = false;
             trigger_interceptor.report_applied_state(
                 None,
                 generation,
@@ -443,6 +464,7 @@ fn engage_pointer_grab(
         }
         Err(grab_error) => {
             *active_intercept_spec = None;
+            *is_suppressed_trigger_held = false;
             trigger_interceptor.report_applied_state(None, generation, Some(grab_error));
         }
     }
@@ -453,6 +475,7 @@ fn poll_all_devices(
     shared_state: &SharedPhysicalInputState,
     trigger_interceptor: &TriggerInterceptor,
     active_intercept_spec: &mut Option<TriggerInterceptSpec>,
+    is_suppressed_trigger_held: &mut bool,
     event_sender: &SyncSender<(InputTrigger, bool)>,
 ) -> bool {
     let mut processed_any_event = false;
@@ -481,9 +504,10 @@ fn poll_all_devices(
         {
             if let Err(forward_error) = process_grabbed_batch(
                 &fetched_events,
-                active_spec.trigger_input,
+                active_spec,
                 device_pool.uinput_injector.as_deref(),
                 shared_state,
+                is_suppressed_trigger_held,
                 event_sender,
             ) {
                 forward_error_message = Some(forward_error);
@@ -498,13 +522,15 @@ fn poll_all_devices(
         error!("Emergency ungrab after forwarding failure: {error_detail}");
         device_pool.release_all_grabs();
         *active_intercept_spec = None;
+        *is_suppressed_trigger_held = false;
         trigger_interceptor.force_deactivate_on_error(error_detail);
     }
 
     for disconnected_index in disconnected_indices.into_iter().rev() {
-        let mut removed = device_pool.devices.swap_remove(disconnected_index);
+        let mut removed = device_pool.devices.remove(disconnected_index);
         if removed.is_grabbed {
             let _ = removed.device.ungrab();
+            *is_suppressed_trigger_held = false;
         }
     }
 
@@ -543,9 +569,10 @@ fn process_passive_batch(
 
 fn process_grabbed_batch(
     events: &[InputEvent],
-    suppressed_trigger: InputTrigger,
+    intercept_spec: TriggerInterceptSpec,
     uinput_injector: Option<&UinputInjector>,
     shared_state: &SharedPhysicalInputState,
+    is_suppressed_trigger_held: &mut bool,
     event_sender: &SyncSender<(InputTrigger, bool)>,
 ) -> Result<(), String> {
     let Some(injector) = uinput_injector else {
@@ -554,7 +581,12 @@ fn process_grabbed_batch(
     let mut forwarded_frame = Vec::with_capacity(16);
 
     for input_event in events {
-        match classify_grabbed_pointer_event(*input_event, suppressed_trigger) {
+        match classify_grabbed_pointer_event(
+            *input_event,
+            intercept_spec,
+            shared_state,
+            is_suppressed_trigger_held,
+        ) {
             GrabbedEventDecision::SuppressTrigger {
                 trigger,
                 is_pressed,

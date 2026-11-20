@@ -17,13 +17,28 @@ pub enum BlockCategory {
     Variable,
 }
 
+/// Maximum number of additional simultaneous chord inputs allowed on a `TriggerBlock`.
+pub const MAX_TRIGGER_AND_INPUTS: usize = 4;
+
 /// Top-level trigger controlling when a Visual Block program runs its body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerBlock {
-    WhileInputHeld { trigger_input: InputTrigger },
-    OnInputToggle { trigger_input: InputTrigger },
-    OnInputPressed { trigger_input: InputTrigger },
+    WhileInputHeld {
+        trigger_input: InputTrigger,
+        #[serde(default)]
+        additional_held_inputs: Vec<InputTrigger>,
+    },
+    OnInputToggle {
+        trigger_input: InputTrigger,
+        #[serde(default)]
+        additional_held_inputs: Vec<InputTrigger>,
+    },
+    OnInputPressed {
+        trigger_input: InputTrigger,
+        #[serde(default)]
+        additional_held_inputs: Vec<InputTrigger>,
+    },
     LoopWhileActive,
 }
 
@@ -31,24 +46,102 @@ impl TriggerBlock {
     /// Returns the physical input trigger bound to this header block, if any.
     pub fn trigger_input(&self) -> Option<InputTrigger> {
         match self {
-            Self::WhileInputHeld { trigger_input }
-            | Self::OnInputToggle { trigger_input }
-            | Self::OnInputPressed { trigger_input } => Some(*trigger_input),
+            Self::WhileInputHeld { trigger_input, .. }
+            | Self::OnInputToggle { trigger_input, .. }
+            | Self::OnInputPressed { trigger_input, .. } => Some(*trigger_input),
             Self::LoopWhileActive => None,
         }
     }
 
+    /// Returns any additional chord inputs that must be held simultaneously with the primary input.
+    pub fn additional_held_inputs(&self) -> &[InputTrigger] {
+        match self {
+            Self::WhileInputHeld {
+                additional_held_inputs,
+                ..
+            }
+            | Self::OnInputToggle {
+                additional_held_inputs,
+                ..
+            }
+            | Self::OnInputPressed {
+                additional_held_inputs,
+                ..
+            } => additional_held_inputs.as_slice(),
+            Self::LoopWhileActive => &[],
+        }
+    }
+
+    /// Returns a mutable handle to the additional chord inputs slice when supported by this trigger.
+    pub fn additional_held_inputs_mut(&mut self) -> Option<&mut Vec<InputTrigger>> {
+        match self {
+            Self::WhileInputHeld {
+                additional_held_inputs,
+                ..
+            }
+            | Self::OnInputToggle {
+                additional_held_inputs,
+                ..
+            }
+            | Self::OnInputPressed {
+                additional_held_inputs,
+                ..
+            } => Some(additional_held_inputs),
+            Self::LoopWhileActive => None,
+        }
+    }
+
+    /// Collects the primary trigger input followed by all additional chord inputs.
+    pub fn all_trigger_inputs(&self) -> Vec<InputTrigger> {
+        let Some(primary_input) = self.trigger_input() else {
+            return Vec::new();
+        };
+        let additional_inputs = self.additional_held_inputs();
+        let mut combined_inputs =
+            Vec::with_capacity(1_usize.saturating_add(additional_inputs.len()));
+        combined_inputs.push(primary_input);
+        combined_inputs.extend_from_slice(additional_inputs);
+        combined_inputs
+    }
+
+    /// Formats the trigger chord labels joined with ` + `, or `None` for `LoopWhileActive`.
+    pub fn chord_display_label(&self) -> Option<String> {
+        let combined_inputs = self.all_trigger_inputs();
+        if combined_inputs.is_empty() {
+            return None;
+        }
+        let labels: Vec<&'static str> = combined_inputs
+            .into_iter()
+            .map(InputTrigger::display_label)
+            .collect();
+        Some(labels.join(" + "))
+    }
+
     /// Returns a readable summary for the block canvas header.
     pub fn display_label(&self) -> String {
+        let has_chord_inputs = !self.additional_held_inputs().is_empty();
+        let chord_label = self.chord_display_label().unwrap_or_default();
         match self {
-            Self::WhileInputHeld { trigger_input } => {
-                format!("While {} is held", trigger_input.display_label())
+            Self::WhileInputHeld { .. } => {
+                if has_chord_inputs {
+                    format!("While {chord_label} are held")
+                } else {
+                    format!("While {chord_label} is held")
+                }
             }
-            Self::OnInputToggle { trigger_input } => {
-                format!("Toggle loop on {} press", trigger_input.display_label())
+            Self::OnInputToggle { .. } => {
+                if has_chord_inputs {
+                    format!("Toggle loop on {chord_label}")
+                } else {
+                    format!("Toggle loop on {chord_label} press")
+                }
             }
-            Self::OnInputPressed { trigger_input } => {
-                format!("Once when {} is pressed", trigger_input.display_label())
+            Self::OnInputPressed { .. } => {
+                if has_chord_inputs {
+                    format!("Once on {chord_label}")
+                } else {
+                    format!("Once when {chord_label} is pressed")
+                }
             }
             Self::LoopWhileActive => "Loop continuously while active".to_string(),
         }
@@ -210,6 +303,7 @@ pub enum StatementKind {
     },
     BreakLoop,
     StopScript,
+    DoNothing,
     MouseClick {
         mouse_button: MouseButton,
         hold_duration_ms: u64,
@@ -275,7 +369,8 @@ impl StatementKind {
             | Self::WhileCondition { .. }
             | Self::RepeatCount { .. }
             | Self::BreakLoop
-            | Self::StopScript => BlockCategory::Control,
+            | Self::StopScript
+            | Self::DoNothing => BlockCategory::Control,
             Self::MouseClick { .. }
             | Self::MouseDown { .. }
             | Self::MouseUp { .. }
@@ -301,6 +396,7 @@ impl StatementKind {
             Self::RepeatCount { .. } => "Repeat",
             Self::BreakLoop => "Break Loop",
             Self::StopScript => "Stop Script",
+            Self::DoNothing => "Do Nothing",
             Self::MouseClick { .. } => "Mouse Click",
             Self::MouseDown { .. } => "Mouse Down",
             Self::MouseUp { .. } => "Mouse Up",
@@ -509,6 +605,7 @@ mod tests {
     fn visual_program_supports_nested_insert_move_remove_and_emitted_keys() {
         let mut program = VisualProgram::new(TriggerBlock::WhileInputHeld {
             trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: Vec::new(),
         });
         let loop_id = program.append_root_block(StatementKind::RepeatCount {
             repeat_count: 3,
@@ -560,5 +657,45 @@ mod tests {
 
         assert!(program.remove_block(tap_id).is_some());
         assert!(!program.contains_block_id(tap_id));
+    }
+
+    #[test]
+    fn trigger_block_deserializes_legacy_json_and_round_trips_chords_and_do_nothing()
+    -> Result<(), serde_json::Error> {
+        let legacy_json =
+            r#"{"kind":"while_input_held","trigger_input":{"kind":"mouse","code":"left"}}"#;
+        let legacy_trigger: TriggerBlock = serde_json::from_str(legacy_json)?;
+        assert_eq!(
+            legacy_trigger,
+            TriggerBlock::WhileInputHeld {
+                trigger_input: InputTrigger::Mouse(MouseButton::Left),
+                additional_held_inputs: Vec::new(),
+            }
+        );
+        assert_eq!(legacy_trigger.display_label(), "While Left Mouse is held");
+
+        let mut chord_program = VisualProgram::new(TriggerBlock::WhileInputHeld {
+            trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
+        });
+        chord_program.append_root_block(StatementKind::DoNothing);
+        assert_eq!(
+            chord_program.trigger.display_label(),
+            "While Left Mouse + Left Shift are held"
+        );
+        assert_eq!(
+            chord_program.trigger.all_trigger_inputs(),
+            vec![
+                InputTrigger::Mouse(MouseButton::Left),
+                InputTrigger::Key(KeyCode::LeftShift),
+            ]
+        );
+        assert_eq!(StatementKind::DoNothing.category(), BlockCategory::Control);
+        assert_eq!(StatementKind::DoNothing.title(), "Do Nothing");
+
+        let serialized_program = serde_json::to_string(&chord_program)?;
+        let deserialized_program: VisualProgram = serde_json::from_str(&serialized_program)?;
+        assert_eq!(deserialized_program, chord_program);
+        Ok(())
     }
 }

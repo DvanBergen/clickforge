@@ -723,6 +723,7 @@ fn summarize_statement_for_ghost(statement_kind: &StatementKind) -> String {
         StatementKind::RepeatCount { repeat_count, .. } => format!("{repeat_count} times"),
         StatementKind::BreakLoop => "Exit current loop".to_string(),
         StatementKind::StopScript => "End script pass".to_string(),
+        StatementKind::DoNothing => "No action".to_string(),
         StatementKind::MouseClick {
             mouse_button,
             hold_duration_ms,

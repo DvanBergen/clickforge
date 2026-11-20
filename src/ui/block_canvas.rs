@@ -1,17 +1,17 @@
-use clickforge_sdk::{InputTrigger, KeyCode, MouseButton};
+mod trigger_hat;
+
 use egui::{
-    Align, Area, Button, Color32, ComboBox, CornerRadius, CursorIcon, Frame, Id, Layout, Margin,
-    Order, Pos2, Rect, ScrollArea, Shape, Stroke, Ui, pos2,
+    Align, Area, Button, Color32, CornerRadius, CursorIcon, Frame, Id, Layout, Margin, Order, Pos2,
+    Rect, ScrollArea, Shape, Stroke, Ui, pos2,
 };
 
 use crate::models::{
     BlockCategory, BlockId, BlockSlotTarget, ScriptDocument, StatementBlock, StatementKind,
-    TriggerBlock, ValidationReport, VisualProgram,
+    ValidationReport, VisualProgram,
 };
-use crate::ui::block_field_editors::{render_input_trigger_picker, with_pill_well_style};
 use crate::ui::block_node_renderer::{
-    BLOCK_MAX_WIDTH_PX, BlockRenderContext, BlockRenderMutation, FULL_BLOCK_GEOMETRY,
-    build_leaf_block_shapes, build_trigger_hat_shapes, render_statement_stack,
+    BlockRenderContext, BlockRenderMutation, FULL_BLOCK_GEOMETRY, build_leaf_block_shapes,
+    build_trigger_hat_shapes, render_statement_stack,
 };
 use crate::ui::block_palette::{BlockDragPayload, BlockDragState};
 use crate::ui::theme::{
@@ -21,12 +21,13 @@ use crate::ui::theme::{
     block_visual_colors, rich_mono, rich_semibold,
 };
 
+use trigger_hat::render_trigger_hat_block;
+
 const GRID_SPACING_PX: f32 = 22.0;
 const GRID_DOT_RADIUS_PX: f32 = 1.1;
 const GRID_DOT_COLOR: Color32 = Color32::from_rgb(0x2D, 0x34, 0x42);
 const MAX_GRID_COLUMNS: i32 = 140;
 const MAX_GRID_ROWS: i32 = 100;
-const HAT_MIN_WIDTH_PX: f32 = 320.0;
 const DROP_GLOW_WIDTH_PX: f32 = 7.0;
 const DROP_LINE_STROKE_WIDTH_PX: f32 = 3.0;
 const DROP_ENDCAP_RADIUS_PX: f32 = 4.5;
@@ -212,167 +213,6 @@ fn render_canvas_toolbar(
                 });
             });
         });
-}
-
-fn render_trigger_hat_block(
-    ui: &mut Ui,
-    script_id: &str,
-    trigger: &mut TriggerBlock,
-    pointer_pos: Option<Pos2>,
-    drag_state: &mut BlockDragState,
-) -> bool {
-    let visual_colors = block_visual_colors(BlockCategory::Trigger);
-    let mut did_change = false;
-    let background_shape_index = ui.painter().add(Shape::Noop);
-
-    let hat_response = Frame::NONE
-        .inner_margin(Margin {
-            left: 14,
-            right: 16,
-            top: (FULL_BLOCK_GEOMETRY.hat_dome_height_px as i8) + 8,
-            bottom: 9,
-        })
-        .show(ui, |ui| {
-            ui.set_min_width(HAT_MIN_WIDTH_PX);
-            ui.set_max_width(BLOCK_MAX_WIDTH_PX);
-            with_pill_well_style(ui, visual_colors, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(rich_semibold(
-                        "When",
-                        FONT_SIZE_BODY_PX,
-                        visual_colors.text_primary,
-                    ));
-
-                    ComboBox::from_id_salt(("trigger_mode", script_id))
-                        .selected_text(trigger_mode_label(trigger))
-                        .width(156.0)
-                        .show_ui(ui, |ui| {
-                            did_change |= render_trigger_mode_options(ui, trigger);
-                        });
-
-                    match trigger {
-                        TriggerBlock::WhileInputHeld { trigger_input }
-                        | TriggerBlock::OnInputToggle { trigger_input }
-                        | TriggerBlock::OnInputPressed { trigger_input } => {
-                            did_change |= render_input_trigger_picker(
-                                ui,
-                                ("hat_input", script_id),
-                                trigger_input,
-                                visual_colors,
-                            );
-                        }
-                        TriggerBlock::LoopWhileActive => {
-                            ui.label(rich_semibold(
-                                "while armed & focused",
-                                FONT_SIZE_SMALL_PX,
-                                visual_colors.text_muted,
-                            ));
-                        }
-                    }
-                });
-            });
-        });
-
-    let hat_rect = hat_response.response.rect;
-    let is_hovering_replacement = drag_state.is_dragging_trigger()
-        && pointer_pos.is_some_and(|pointer| hat_rect.expand(14.0).contains(pointer));
-    if is_hovering_replacement {
-        drag_state.is_hovering_trigger_hat = true;
-    }
-
-    let (fill_color, border_color, stroke_width_px) = if is_hovering_replacement {
-        (visual_colors.fill_hover, ACCENT_PRIMARY, 2.25)
-    } else if drag_state.is_dragging_trigger() {
-        (visual_colors.fill, ACCENT_PRIMARY, 1.75)
-    } else {
-        (
-            visual_colors.fill,
-            visual_colors.border,
-            FULL_BLOCK_GEOMETRY.stroke_width_px,
-        )
-    };
-
-    let hat_shapes = build_trigger_hat_shapes(
-        hat_rect,
-        FULL_BLOCK_GEOMETRY,
-        fill_color,
-        border_color,
-        visual_colors.top_highlight,
-        stroke_width_px,
-    );
-    ui.painter()
-        .set(background_shape_index, Shape::Vec(hat_shapes));
-
-    did_change
-}
-
-fn render_trigger_mode_options(ui: &mut Ui, trigger: &mut TriggerBlock) -> bool {
-    let mut did_change = false;
-    if ui
-        .selectable_label(
-            matches!(trigger, TriggerBlock::WhileInputHeld { .. }),
-            "While Input Held",
-        )
-        .clicked()
-    {
-        let input = trigger
-            .trigger_input()
-            .unwrap_or(InputTrigger::Mouse(MouseButton::Left));
-        *trigger = TriggerBlock::WhileInputHeld {
-            trigger_input: input,
-        };
-        did_change = true;
-    }
-    if ui
-        .selectable_label(
-            matches!(trigger, TriggerBlock::OnInputToggle { .. }),
-            "Toggle on Input",
-        )
-        .clicked()
-    {
-        let input = trigger
-            .trigger_input()
-            .unwrap_or(InputTrigger::Key(KeyCode::F5));
-        *trigger = TriggerBlock::OnInputToggle {
-            trigger_input: input,
-        };
-        did_change = true;
-    }
-    if ui
-        .selectable_label(
-            matches!(trigger, TriggerBlock::OnInputPressed { .. }),
-            "Once on Press",
-        )
-        .clicked()
-    {
-        let input = trigger
-            .trigger_input()
-            .unwrap_or(InputTrigger::Mouse(MouseButton::Side));
-        *trigger = TriggerBlock::OnInputPressed {
-            trigger_input: input,
-        };
-        did_change = true;
-    }
-    if ui
-        .selectable_label(
-            matches!(trigger, TriggerBlock::LoopWhileActive),
-            "Loop While Active",
-        )
-        .clicked()
-    {
-        *trigger = TriggerBlock::LoopWhileActive;
-        did_change = true;
-    }
-    did_change
-}
-
-fn trigger_mode_label(trigger: &TriggerBlock) -> &'static str {
-    match trigger {
-        TriggerBlock::WhileInputHeld { .. } => "While Input Held",
-        TriggerBlock::OnInputToggle { .. } => "Toggle on Input",
-        TriggerBlock::OnInputPressed { .. } => "Once on Press",
-        TriggerBlock::LoopWhileActive => "Loop While Active",
-    }
 }
 
 fn apply_render_mutations(

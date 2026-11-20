@@ -2,7 +2,9 @@ use clickforge_sdk::{GaussianRangeMs, InputTrigger, KeyCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::models::blocks::{BlockId, ConditionExpr, StatementBlock, StatementKind};
+use crate::models::blocks::{
+    BlockId, ConditionExpr, MAX_TRIGGER_AND_INPUTS, StatementBlock, StatementKind,
+};
 use crate::models::script::{ScriptDocument, ScriptMode};
 use crate::models::target::TargetScope;
 
@@ -51,6 +53,7 @@ pub enum ValidationIssueCode {
     NonFiniteNumericValue,
     ExcessiveBlockNesting,
     TooManyBlocks,
+    TooManyTriggerInputs,
     EmptyRustSource,
     RustSourceTooLarge,
     TypeTextTooLong,
@@ -208,27 +211,34 @@ fn validate_kill_switch_and_key_bindings(script: &ScriptDocument, report: &mut V
         return;
     }
 
-    if let Some(InputTrigger::Key(trigger_key)) = script.visual_program.trigger.trigger_input() {
-        if trigger_key == kill_switch_key {
-            report.push_issue(
-                ValidationIssueCode::KillSwitchCollidesWithTriggerKey,
-                None,
-                format!(
-                    "Hard Kill-Switch key ({}) cannot match the script trigger key.",
-                    kill_switch_key.display_label()
-                ),
-            );
-        }
-        if script.arm_toggle_key == Some(trigger_key) {
-            report.push_issue(
-                ValidationIssueCode::ArmToggleCollidesWithTriggerKey,
-                None,
-                format!(
-                    "Arm Toggle key ({}) cannot match the script trigger key.",
-                    trigger_key.display_label()
-                ),
-            );
-        }
+    let all_trigger_keys: Vec<KeyCode> = script
+        .visual_program
+        .trigger
+        .all_trigger_inputs()
+        .into_iter()
+        .filter_map(InputTrigger::key_code)
+        .collect();
+    if all_trigger_keys.contains(&kill_switch_key) {
+        report.push_issue(
+            ValidationIssueCode::KillSwitchCollidesWithTriggerKey,
+            None,
+            format!(
+                "Hard Kill-Switch key ({}) cannot match any script trigger key.",
+                kill_switch_key.display_label()
+            ),
+        );
+    }
+    if let Some(arm_key) = script.arm_toggle_key
+        && all_trigger_keys.contains(&arm_key)
+    {
+        report.push_issue(
+            ValidationIssueCode::ArmToggleCollidesWithTriggerKey,
+            None,
+            format!(
+                "Arm Toggle key ({}) cannot match any script trigger key.",
+                arm_key.display_label()
+            ),
+        );
     }
 
     let emitted_keys = script.visual_program.collect_emitted_keys();
@@ -275,6 +285,16 @@ fn validate_rust_source(rust_source: &str, report: &mut ValidationReport) {
 }
 
 fn validate_visual_program(script: &ScriptDocument, report: &mut ValidationReport) {
+    let additional_input_count = script.visual_program.trigger.additional_held_inputs().len();
+    if additional_input_count > MAX_TRIGGER_AND_INPUTS {
+        report.push_issue(
+            ValidationIssueCode::TooManyTriggerInputs,
+            None,
+            format!(
+                "Trigger chord has {additional_input_count} additional inputs, exceeding limit of {MAX_TRIGGER_AND_INPUTS}."
+            ),
+        );
+    }
     let block_count = script.visual_program.total_block_count();
     if block_count > MAX_BLOCKS_PER_SCRIPT {
         report.push_issue(
@@ -439,6 +459,7 @@ fn validate_single_statement(
         } => validate_variable_mutation(variable_name, *delta_value, block_id, report),
         StatementKind::BreakLoop
         | StatementKind::StopScript
+        | StatementKind::DoNothing
         | StatementKind::MouseDown { .. }
         | StatementKind::MouseUp { .. }
         | StatementKind::MouseMoveRelative { .. }
@@ -575,12 +596,14 @@ mod tests {
         script.arm_toggle_key = Some(KeyCode::F7);
         script.visual_program.trigger = TriggerBlock::WhileInputHeld {
             trigger_input: InputTrigger::Key(KeyCode::F6),
+            additional_held_inputs: Vec::new(),
         };
         let trigger_report = inspect_script_validation(&script);
         assert!(trigger_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey));
 
         script.visual_program.trigger = TriggerBlock::WhileInputHeld {
             trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: Vec::new(),
         };
         script.kill_switch_key = Some(KeyCode::E);
         script
@@ -592,6 +615,38 @@ mod tests {
             });
         let emitted_report = inspect_script_validation(&script);
         assert!(emitted_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithEmittedKey));
+    }
+
+    #[test]
+    fn additional_chord_inputs_cannot_collide_with_kill_switch_or_exceed_cap() {
+        let mut script = ScriptDocument::new_building_upgrade_template();
+        script.kill_switch_key = Some(KeyCode::F8);
+        script.arm_toggle_key = Some(KeyCode::F6);
+        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
+            trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: vec![
+                InputTrigger::Key(KeyCode::LeftShift),
+                InputTrigger::Key(KeyCode::F8),
+                InputTrigger::Key(KeyCode::F6),
+            ],
+        };
+
+        let collision_report = inspect_script_validation(&script);
+        assert!(collision_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey));
+        assert!(collision_report.has_issue(ValidationIssueCode::ArmToggleCollidesWithTriggerKey));
+
+        script.visual_program.trigger = TriggerBlock::WhileInputHeld {
+            trigger_input: InputTrigger::Mouse(MouseButton::Left),
+            additional_held_inputs: vec![
+                InputTrigger::Key(KeyCode::LeftShift),
+                InputTrigger::Key(KeyCode::LeftCtrl),
+                InputTrigger::Key(KeyCode::LeftAlt),
+                InputTrigger::Key(KeyCode::Space),
+                InputTrigger::Key(KeyCode::Tab),
+            ],
+        };
+        let cap_report = inspect_script_validation(&script);
+        assert!(cap_report.has_issue(ValidationIssueCode::TooManyTriggerInputs));
     }
 
     #[test]

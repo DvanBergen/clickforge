@@ -307,6 +307,7 @@ fn interpreter_executes_if_else_repeat_variables_and_type_text_in_order() -> Res
 fn abort_during_long_wait_stops_immediately_and_releases_held_keys() -> Result<(), String> {
     let mut program = VisualProgram::new(TriggerBlock::WhileInputHeld {
         trigger_input: InputTrigger::Mouse(MouseButton::Left),
+        additional_held_inputs: Vec::new(),
     });
     program.append_root_block(StatementKind::KeyDown {
         key_code: KeyCode::W,

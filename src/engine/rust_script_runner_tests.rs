@@ -255,6 +255,7 @@ fn compiles_complex_codegen_program_with_variables_and_random_chance() {
     let mut script = ScriptDocument::new_building_upgrade_template();
     script.visual_program = VisualProgram::new(TriggerBlock::OnInputToggle {
         trigger_input: InputTrigger::Key(KeyCode::F7),
+        additional_held_inputs: vec![InputTrigger::Key(KeyCode::LeftShift)],
     });
     script
         .visual_program
@@ -273,9 +274,10 @@ fn compiles_complex_codegen_program_with_variables_and_random_chance() {
         keystroke_delay_ms: 10,
         jitter_ms: 2,
     });
+    let noop_block = script.visual_program.create_block(StatementKind::DoNothing);
     script
         .visual_program
-        .append_root_block(StatementKind::IfThen {
+        .append_root_block(StatementKind::IfThenElse {
             condition: ConditionExpr::And {
                 left_condition: Box::new(ConditionExpr::RandomChance {
                     chance_percent: 50.0,
@@ -287,6 +289,7 @@ fn compiles_complex_codegen_program_with_variables_and_random_chance() {
                 }),
             },
             then_blocks: vec![increment_block, type_block],
+            else_blocks: vec![noop_block],
         });
     script.rust_source = generate_rust_source_from_script(&script);
     script.mode = ScriptMode::AdvancedRust;

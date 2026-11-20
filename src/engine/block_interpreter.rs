@@ -137,6 +137,7 @@ impl<'run> InterpreterState<'run> {
             } => self.execute_repeat_count(*repeat_count, body_blocks),
             StatementKind::BreakLoop => Ok(BlockControlFlow::BreakLoop),
             StatementKind::StopScript => Ok(BlockControlFlow::StopScript),
+            StatementKind::DoNothing => Ok(BlockControlFlow::Continue),
             StatementKind::MouseClick { .. }
             | StatementKind::MouseDown { .. }
             | StatementKind::MouseUp { .. }
@@ -479,29 +480,65 @@ pub fn execute_visual_program(
         last_active_block_id: None,
     };
 
-    let outcome = match program.trigger {
-        TriggerBlock::WhileInputHeld { trigger_input } => {
-            run_while_input_held(&mut state, trigger_input, &program.statements)
-        }
-        TriggerBlock::OnInputToggle { trigger_input } => {
-            run_on_input_toggle(&mut state, trigger_input, &program.statements)
-        }
-        TriggerBlock::OnInputPressed { trigger_input } => {
-            run_on_input_pressed(&mut state, trigger_input, &program.statements)
-        }
+    let outcome = match &program.trigger {
+        TriggerBlock::WhileInputHeld {
+            trigger_input,
+            additional_held_inputs,
+        } => run_while_input_held(
+            &mut state,
+            *trigger_input,
+            additional_held_inputs,
+            &program.statements,
+        ),
+        TriggerBlock::OnInputToggle {
+            trigger_input,
+            additional_held_inputs,
+        } => run_on_input_toggle(
+            &mut state,
+            *trigger_input,
+            additional_held_inputs,
+            &program.statements,
+        ),
+        TriggerBlock::OnInputPressed {
+            trigger_input,
+            additional_held_inputs,
+        } => run_on_input_pressed(
+            &mut state,
+            *trigger_input,
+            additional_held_inputs,
+            &program.statements,
+        ),
         TriggerBlock::LoopWhileActive => run_loop_while_active(&mut state, &program.statements),
     };
     state.set_active_block(None);
     outcome
 }
 
+fn are_all_inputs_pressed(
+    physical_input: &dyn PhysicalInputReader,
+    trigger_input: InputTrigger,
+    additional_held_inputs: &[InputTrigger],
+) -> bool {
+    if !physical_input.is_trigger_pressed(trigger_input) {
+        return false;
+    }
+    additional_held_inputs
+        .iter()
+        .all(|required_input| physical_input.is_trigger_pressed(*required_input))
+}
+
 fn run_while_input_held(
     state: &mut InterpreterState<'_>,
     trigger_input: InputTrigger,
+    additional_held_inputs: &[InputTrigger],
     statements: &[StatementBlock],
 ) -> Result<ProgramStopReason, String> {
     while !state.is_aborted() {
-        if !state.physical_input.is_trigger_pressed(trigger_input) {
+        if !are_all_inputs_pressed(
+            state.physical_input.as_ref(),
+            trigger_input,
+            additional_held_inputs,
+        ) {
             state.set_active_block(None);
             state.wait_idle_slice();
             continue;
@@ -523,13 +560,18 @@ fn run_while_input_held(
 fn run_on_input_toggle(
     state: &mut InterpreterState<'_>,
     trigger_input: InputTrigger,
+    additional_held_inputs: &[InputTrigger],
     statements: &[StatementBlock],
 ) -> Result<ProgramStopReason, String> {
     let mut is_toggle_active = false;
     let mut was_trigger_pressed = false;
 
     while !state.is_aborted() {
-        let is_trigger_pressed = state.physical_input.is_trigger_pressed(trigger_input);
+        let is_trigger_pressed = are_all_inputs_pressed(
+            state.physical_input.as_ref(),
+            trigger_input,
+            additional_held_inputs,
+        );
         if is_trigger_pressed && !was_trigger_pressed {
             is_toggle_active = !is_toggle_active;
         }
@@ -557,12 +599,17 @@ fn run_on_input_toggle(
 fn run_on_input_pressed(
     state: &mut InterpreterState<'_>,
     trigger_input: InputTrigger,
+    additional_held_inputs: &[InputTrigger],
     statements: &[StatementBlock],
 ) -> Result<ProgramStopReason, String> {
     let mut was_trigger_pressed = false;
 
     while !state.is_aborted() {
-        let is_trigger_pressed = state.physical_input.is_trigger_pressed(trigger_input);
+        let is_trigger_pressed = are_all_inputs_pressed(
+            state.physical_input.as_ref(),
+            trigger_input,
+            additional_held_inputs,
+        );
         if !is_trigger_pressed || was_trigger_pressed {
             was_trigger_pressed = is_trigger_pressed;
             state.set_active_block(None);

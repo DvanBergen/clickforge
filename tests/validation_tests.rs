@@ -66,6 +66,7 @@ fn kill_switch_collisions_with_trigger_arm_emitted_and_condition_keys_are_blocke
     trigger_collision_script.kill_switch_key = Some(KeyCode::F7);
     trigger_collision_script.visual_program.trigger = TriggerBlock::WhileInputHeld {
         trigger_input: InputTrigger::Key(KeyCode::F7),
+        additional_held_inputs: Vec::new(),
     };
     let trigger_report = inspect_script_validation(&trigger_collision_script);
     assert!(trigger_report.has_issue(ValidationIssueCode::KillSwitchCollidesWithTriggerKey));

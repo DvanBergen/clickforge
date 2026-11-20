@@ -15,6 +15,7 @@ pub(super) enum PaletteTemplateId {
     RepeatCount,
     BreakLoop,
     StopScript,
+    DoNothing,
     MouseClick,
     MouseDown,
     MouseUp,
@@ -55,7 +56,7 @@ const fn define_template(
     }
 }
 
-pub(super) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 24] = [
+pub(super) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 25] = [
     define_template(
         PaletteTemplateId::WhileHeld,
         "While Input Held",
@@ -123,6 +124,13 @@ pub(super) const PALETTE_TEMPLATES: [PaletteTemplateSpec; 24] = [
         PaletteTemplateId::StopScript,
         "Stop Script",
         "Stops the current script pass immediately",
+        BlockCategory::Control,
+        false,
+    ),
+    define_template(
+        PaletteTemplateId::DoNothing,
+        "Do Nothing",
+        "Explicit placeholder block that performs no action (useful inside If / Else branches)",
         BlockCategory::Control,
         false,
     ),
@@ -233,6 +241,7 @@ pub(super) fn build_template_action_and_payload(
         PaletteTemplateId::WhileHeld => {
             let trigger = TriggerBlock::WhileInputHeld {
                 trigger_input: InputTrigger::Mouse(MouseButton::Left),
+                additional_held_inputs: Vec::new(),
             };
             (
                 PaletteAction::ApplyTrigger(trigger.clone()),
@@ -242,6 +251,7 @@ pub(super) fn build_template_action_and_payload(
         PaletteTemplateId::ToggleInput => {
             let trigger = TriggerBlock::OnInputToggle {
                 trigger_input: InputTrigger::Key(KeyCode::F5),
+                additional_held_inputs: Vec::new(),
             };
             (
                 PaletteAction::ApplyTrigger(trigger.clone()),
@@ -251,6 +261,7 @@ pub(super) fn build_template_action_and_payload(
         PaletteTemplateId::OncePressed => {
             let trigger = TriggerBlock::OnInputPressed {
                 trigger_input: InputTrigger::Mouse(MouseButton::Side),
+                additional_held_inputs: Vec::new(),
             };
             (
                 PaletteAction::ApplyTrigger(trigger.clone()),
@@ -297,6 +308,7 @@ fn build_default_statement_kind(template_id: PaletteTemplateId) -> StatementKind
         },
         PaletteTemplateId::BreakLoop => StatementKind::BreakLoop,
         PaletteTemplateId::StopScript => StatementKind::StopScript,
+        PaletteTemplateId::DoNothing => StatementKind::DoNothing,
         PaletteTemplateId::MouseClick => StatementKind::MouseClick {
             mouse_button: MouseButton::Left,
             hold_duration_ms: 12,
