@@ -50,6 +50,7 @@ const HIDDEN_REPAINT_INTERVAL_MS: u64 = 250;
 const STATUS_TOAST_DURATION_MS: u64 = 4_000;
 const TOAST_CLEARANCE_ABOVE_DRAWER_PX: f32 = 14.0;
 const TOAST_RIGHT_MARGIN_PX: f32 = 16.0;
+const WAYLAND_DISPLAY_ENV_VAR: &str = "WAYLAND_DISPLAY";
 
 /// Startup dependency bundle passed from `main.rs` into `ClickForgeWorkbenchApp`.
 pub struct WorkbenchLaunchBundle {
@@ -176,6 +177,16 @@ impl ClickForgeWorkbenchApp {
         }
     }
 
+    pub(crate) fn request_clean_quit(&mut self, egui_context: &egui::Context) {
+        self.should_allow_window_close = true;
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        if self.is_window_hidden_to_tray {
+            self.is_window_hidden_to_tray = false;
+            egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
+        }
+        egui_context.send_viewport_cmd(ViewportCommand::Close);
+    }
+
     fn handle_tray_events(&mut self, egui_context: &egui::Context) {
         while let Ok(tray_event) = self.tray_event_receiver.try_recv() {
             match tray_event {
@@ -185,6 +196,12 @@ impl ClickForgeWorkbenchApp {
                     egui_context.send_viewport_cmd(ViewportCommand::Focus);
                 }
                 TrayUiEvent::ToggleMainWindow => {
+                    if is_wayland_display_session() {
+                        self.is_window_hidden_to_tray = false;
+                        egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
+                        egui_context.send_viewport_cmd(ViewportCommand::Focus);
+                        continue;
+                    }
                     self.is_window_hidden_to_tray = !self.is_window_hidden_to_tray;
                     egui_context.send_viewport_cmd(ViewportCommand::Visible(
                         !self.is_window_hidden_to_tray,
@@ -204,10 +221,7 @@ impl ClickForgeWorkbenchApp {
                     self.disable_all_scripts();
                 }
                 TrayUiEvent::QuitApplication => {
-                    self.should_allow_window_close = true;
-                    self.shutdown_flag.store(true, Ordering::SeqCst);
-                    egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
-                    egui_context.send_viewport_cmd(ViewportCommand::Close);
+                    self.request_clean_quit(egui_context);
                 }
             }
         }
@@ -219,7 +233,11 @@ impl ClickForgeWorkbenchApp {
         if !is_close_requested || self.should_allow_window_close {
             return;
         }
-        if self.settings.minimize_to_tray_on_close && self.tray_handle.is_some() {
+        if should_intercept_close_to_tray(
+            is_wayland_display_session(),
+            self.settings.minimize_to_tray_on_close,
+            self.tray_handle.is_some(),
+        ) {
             egui_context.send_viewport_cmd(ViewportCommand::CancelClose);
             egui_context.send_viewport_cmd(ViewportCommand::Visible(false));
             self.is_window_hidden_to_tray = true;
@@ -556,16 +574,17 @@ impl eframe::App for ClickForgeWorkbenchApp {
     fn logic(&mut self, egui_context: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.did_apply_initial_visibility {
             self.did_apply_initial_visibility = true;
-            if self.settings.start_minimized_to_tray && self.tray_handle.is_some() {
+            if !is_wayland_display_session()
+                && self.settings.start_minimized_to_tray
+                && self.tray_handle.is_some()
+            {
                 egui_context.send_viewport_cmd(ViewportCommand::Visible(false));
                 self.is_window_hidden_to_tray = true;
             }
         }
 
         if self.shutdown_flag.load(Ordering::Relaxed) && !self.should_allow_window_close {
-            self.should_allow_window_close = true;
-            egui_context.send_viewport_cmd(ViewportCommand::Visible(true));
-            egui_context.send_viewport_cmd(ViewportCommand::Close);
+            self.request_clean_quit(egui_context);
         }
 
         self.handle_tray_events(egui_context);
@@ -595,10 +614,11 @@ impl eframe::App for ClickForgeWorkbenchApp {
                     snapshot: &self.latest_snapshot,
                     settings: &self.settings,
                     has_system_tray: self.tray_handle.is_some(),
+                    is_wayland_session: is_wayland_display_session(),
                 };
                 render_sidebar(ui, &sidebar_view, &mut sidebar_actions);
             });
-        self.apply_sidebar_actions(sidebar_actions);
+        self.apply_sidebar_actions(&egui_context, sidebar_actions);
 
         if !self.latest_snapshot.input_status.is_uinput_ready {
             Panel::top("uinput_offline_banner_panel")
@@ -659,7 +679,7 @@ impl eframe::App for ClickForgeWorkbenchApp {
             &mut self.new_script_modal_state,
             &mut modal_sidebar_actions,
         );
-        self.apply_sidebar_actions(modal_sidebar_actions);
+        self.apply_sidebar_actions(&egui_context, modal_sidebar_actions);
 
         self.render_toasts(&egui_context, rendered_drawer_height_px);
     }
@@ -737,4 +757,36 @@ fn render_empty_workbench_center(ui: &mut Ui) {
                 });
             });
     });
+}
+
+/// Returns `true` when the active session runs on a Wayland display server.
+pub(crate) fn is_wayland_display_session() -> bool {
+    std::env::var_os(WAYLAND_DISPLAY_ENV_VAR).is_some_and(|display_name| !display_name.is_empty())
+}
+
+fn should_intercept_close_to_tray(
+    is_wayland_session: bool,
+    minimize_to_tray_on_close: bool,
+    has_system_tray: bool,
+) -> bool {
+    !is_wayland_session && minimize_to_tray_on_close && has_system_tray
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_intercept_close_to_tray;
+
+    #[test]
+    fn wayland_never_intercepts_window_close_even_when_minimize_setting_is_true() {
+        assert!(!should_intercept_close_to_tray(true, true, true));
+        assert!(!should_intercept_close_to_tray(true, false, true));
+        assert!(!should_intercept_close_to_tray(true, true, false));
+    }
+
+    #[test]
+    fn x11_intercepts_window_close_only_when_tray_and_setting_are_enabled() {
+        assert!(should_intercept_close_to_tray(false, true, true));
+        assert!(!should_intercept_close_to_tray(false, false, true));
+        assert!(!should_intercept_close_to_tray(false, true, false));
+    }
 }

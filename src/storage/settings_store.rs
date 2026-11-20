@@ -21,6 +21,9 @@ pub const DEFAULT_WINDOW_HEIGHT_PX: f32 = 820.0;
 /// Default telemetry drawer height in logical pixels.
 pub const DEFAULT_TELEMETRY_DRAWER_HEIGHT_PX: f32 = 176.0;
 
+/// Default preference for minimizing to the system tray on window close.
+pub const DEFAULT_MINIMIZE_TO_TRAY_ON_CLOSE: bool = false;
+
 const MIN_WINDOW_WIDTH_PX: f32 = 800.0;
 const MAX_WINDOW_WIDTH_PX: f32 = 7680.0;
 const MIN_WINDOW_HEIGHT_PX: f32 = 560.0;
@@ -45,7 +48,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            minimize_to_tray_on_close: true,
+            minimize_to_tray_on_close: DEFAULT_MINIMIZE_TO_TRAY_ON_CLOSE,
             start_minimized_to_tray: false,
             show_telemetry_drawer: false,
             telemetry_drawer_height_px: DEFAULT_TELEMETRY_DRAWER_HEIGHT_PX,
@@ -149,10 +152,15 @@ mod tests {
         fs::create_dir_all(&temp_dir)?;
 
         let store = SettingsStore::new_with_base_dir(temp_dir.clone());
-        assert_eq!(store.load()?, AppSettings::default());
+        let loaded_defaults = store.load()?;
+        assert_eq!(loaded_defaults, AppSettings::default());
+        assert!(!loaded_defaults.minimize_to_tray_on_close);
+
+        let parsed_empty: AppSettings = serde_json::from_str("{}")?;
+        assert!(!parsed_empty.minimize_to_tray_on_close);
 
         let custom_settings = AppSettings {
-            minimize_to_tray_on_close: false,
+            minimize_to_tray_on_close: true,
             window_width_px: 100.0,
             telemetry_drawer_height_px: 5000.0,
             last_selected_script_id: Some("script-1".to_string()),
@@ -161,7 +169,7 @@ mod tests {
         store.save(&custom_settings)?;
 
         let reloaded = store.load()?;
-        assert!(!reloaded.minimize_to_tray_on_close);
+        assert!(reloaded.minimize_to_tray_on_close);
         assert_eq!(reloaded.window_width_px, MIN_WINDOW_WIDTH_PX);
         assert_eq!(reloaded.telemetry_drawer_height_px, MAX_DRAWER_HEIGHT_PX);
         assert_eq!(

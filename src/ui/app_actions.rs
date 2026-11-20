@@ -86,10 +86,18 @@ impl VisualProgramHistory {
 
 impl ClickForgeWorkbenchApp {
     pub(crate) fn process_keyboard_shortcuts(&mut self, egui_context: &egui::Context) {
-        if self.active_key_capture.is_some()
-            || self.target_picker_state.is_open
-            || self.new_script_modal_state.is_open
-        {
+        if self.active_key_capture.is_some() {
+            return;
+        }
+
+        let did_press_quit =
+            egui_context.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Q));
+        if did_press_quit {
+            self.request_clean_quit(egui_context);
+            return;
+        }
+
+        if self.target_picker_state.is_open || self.new_script_modal_state.is_open {
             return;
         }
 
@@ -156,7 +164,11 @@ impl ClickForgeWorkbenchApp {
             .record_snapshot(previous_program, current_block_count, is_pointer_down);
     }
 
-    pub(crate) fn apply_sidebar_actions(&mut self, actions: Vec<SidebarAction>) {
+    pub(crate) fn apply_sidebar_actions(
+        &mut self,
+        egui_context: &egui::Context,
+        actions: Vec<SidebarAction>,
+    ) {
         for action in actions {
             match action {
                 SidebarAction::SelectTab(target_tab) => {
@@ -205,6 +217,9 @@ impl ClickForgeWorkbenchApp {
                 SidebarAction::SetMinimizeToTray(is_minimizing) => {
                     self.settings.minimize_to_tray_on_close = is_minimizing;
                     self.persist_settings_quietly();
+                }
+                SidebarAction::QuitApplication => {
+                    self.request_clean_quit(egui_context);
                 }
             }
         }

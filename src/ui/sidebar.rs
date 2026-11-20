@@ -40,7 +40,14 @@ const BRAND_MARK_SIZE_PX: f32 = 20.0;
 const SELECTED_BAR_WIDTH_PX: f32 = 3.0;
 const SELECTED_BAR_INSET_Y_PX: f32 = 5.0;
 const ROW_ICON_SIZE_PX: f32 = 20.0;
-const FOOTER_RESERVED_HEIGHT_PX: f32 = 54.0;
+const FOOTER_RESERVED_HEIGHT_PX: f32 = 58.0;
+const FOOTER_X11_RESERVED_HEIGHT_PX: f32 = 92.0;
+const FOOTER_TOP_SPACING_PX: f32 = 4.0;
+const FOOTER_DOT_RADIUS_PX: f32 = 3.0;
+const FOOTER_QUIT_BUTTON_MIN_WIDTH_PX: f32 = 54.0;
+const FOOTER_QUIT_BUTTON_HEIGHT_PX: f32 = 26.0;
+const WAYLAND_BG_HINT_TOOLTIP: &str = "Keep on another workspace for background mode.";
+const NO_TRAY_TOOLTIP: &str = "System tray service (StatusNotifierWatcher) was not detected.";
 const TAB_SEGMENT_HEIGHT_PX: f32 = 30.0;
 const TAB_SEGMENT_GAP_PX: f32 = 3.0;
 const TAB_ACTIVE_WIDTH_RATIO: f32 = 0.60;
@@ -85,6 +92,7 @@ pub enum SidebarAction {
         kill_switch_key: Option<KeyCode>,
     },
     SetMinimizeToTray(bool),
+    QuitApplication,
 }
 
 /// Read-only projection passed into `render_sidebar`.
@@ -96,6 +104,7 @@ pub struct SidebarViewModel<'frame> {
     pub snapshot: &'frame CoordinatorSnapshot,
     pub settings: &'frame AppSettings,
     pub has_system_tray: bool,
+    pub is_wayland_session: bool,
 }
 
 /// Renders the full-height left script rail with Active/Editor tabs and grouped scripts.
@@ -109,7 +118,12 @@ pub fn render_sidebar(
     ui.separator();
     ui.add_space(8.0);
 
-    let scroll_height_px = (ui.available_height() - FOOTER_RESERVED_HEIGHT_PX).max(120.0);
+    let footer_reserved_height_px = if view_model.is_wayland_session {
+        FOOTER_RESERVED_HEIGHT_PX
+    } else {
+        FOOTER_X11_RESERVED_HEIGHT_PX
+    };
+    let scroll_height_px = (ui.available_height() - footer_reserved_height_px).max(120.0);
     ScrollArea::vertical()
         .id_salt("sidebar_scripts_scroll")
         .max_height(scroll_height_px)
@@ -120,26 +134,84 @@ pub fn render_sidebar(
             render_filtered_script_group(ui, "Global", false, view_model, emitted_actions);
         });
 
+    render_sidebar_footer(ui, view_model, emitted_actions);
+}
+
+fn render_sidebar_footer(
+    ui: &mut Ui,
+    view_model: &SidebarViewModel<'_>,
+    emitted_actions: &mut Vec<SidebarAction>,
+) {
     ui.separator();
-    ui.add_space(6.0);
+    ui.add_space(FOOTER_TOP_SPACING_PX);
+    if !view_model.is_wayland_session {
+        render_x11_minimize_checkbox(ui, view_model, emitted_actions);
+    }
+    render_footer_action_row(ui, view_model, emitted_actions);
+}
+
+fn render_x11_minimize_checkbox(
+    ui: &mut Ui,
+    view_model: &SidebarViewModel<'_>,
+    emitted_actions: &mut Vec<SidebarAction>,
+) {
     let mut minimize_to_tray = view_model.settings.minimize_to_tray_on_close;
+    let label = RichText::new("Minimize to tray on close")
+        .size(FONT_SIZE_SMALL_PX)
+        .color(TEXT_MUTED);
     let tray_checkbox = ui.add_enabled(
         view_model.has_system_tray,
-        Checkbox::new(
-            &mut minimize_to_tray,
-            RichText::new("Minimize to tray on close")
-                .size(FONT_SIZE_SMALL_PX)
-                .color(TEXT_MUTED),
-        ),
+        Checkbox::new(&mut minimize_to_tray, label),
     );
     if tray_checkbox.changed() {
         emitted_actions.push(SidebarAction::SetMinimizeToTray(minimize_to_tray));
     }
     if !view_model.has_system_tray {
-        tray_checkbox.on_disabled_hover_text(
-            "System tray service (StatusNotifierWatcher) was not detected.",
-        );
+        tray_checkbox.on_disabled_hover_text(NO_TRAY_TOOLTIP);
     }
+}
+
+fn render_footer_action_row(
+    ui: &mut Ui,
+    view_model: &SidebarViewModel<'_>,
+    emitted_actions: &mut Vec<SidebarAction>,
+) {
+    let (status_text, tooltip) = match (view_model.has_system_tray, view_model.is_wayland_session) {
+        (true, true) => ("Tray active", WAYLAND_BG_HINT_TOOLTIP),
+        (false, true) => ("Workspace mode", WAYLAND_BG_HINT_TOOLTIP),
+        (true, false) => ("Tray active", "System tray icon is active."),
+        (false, false) => ("No tray", NO_TRAY_TOOLTIP),
+    };
+    ui.horizontal(|ui| {
+        if view_model.has_system_tray {
+            paint_status_dot(ui, STATUS_RUNNING, FOOTER_DOT_RADIUS_PX).on_hover_text(tooltip);
+        }
+        let hint_label = RichText::new(status_text)
+            .size(FONT_SIZE_SMALL_PX)
+            .color(TEXT_MUTED);
+        ui.label(hint_label).on_hover_text(tooltip);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let quit_button = build_styled_button(
+                rich_semibold("Quit", FONT_SIZE_SMALL_PX, TEXT_PRIMARY),
+                SURFACE_ELEVATED,
+                BORDER_STRONG,
+                CORNER_RADIUS_SM_PX,
+                vec2(
+                    FOOTER_QUIT_BUTTON_MIN_WIDTH_PX,
+                    FOOTER_QUIT_BUTTON_HEIGHT_PX,
+                ),
+            );
+            let response = ui
+                .add(quit_button)
+                .on_hover_text("Quit ClickForge (Ctrl+Q / Mod+Q)");
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                emitted_actions.push(SidebarAction::QuitApplication);
+            }
+        });
+    });
 }
 
 fn render_sidebar_header(
@@ -253,34 +325,27 @@ fn compute_active_tab_pill(
     if enabled_count == 0 {
         return ("0".to_string(), BADGE_MUTED);
     }
-
-    let has_running_or_armed = scripts
-        .iter()
-        .filter(|script| script.is_enabled)
-        .any(|script| {
-            matches!(
+    let has_enabled_phase = |predicate: fn(ScriptExecutionPhase) -> bool| {
+        scripts
+            .iter()
+            .filter(|script| script.is_enabled)
+            .any(|script| {
                 snapshot
                     .status_for_script(&script.id)
-                    .map(|status| status.phase),
-                Some(ScriptExecutionPhase::Running | ScriptExecutionPhase::Armed)
-            )
-        });
-    if has_running_or_armed {
+                    .is_some_and(|status| predicate(status.phase))
+            })
+    };
+    if has_enabled_phase(|phase| {
+        matches!(
+            phase,
+            ScriptExecutionPhase::Running | ScriptExecutionPhase::Armed
+        )
+    }) {
         return (format!("{enabled_count} ON"), BADGE_RUNNING);
     }
-
-    let has_error = scripts
-        .iter()
-        .filter(|script| script.is_enabled)
-        .any(|script| {
-            snapshot
-                .status_for_script(&script.id)
-                .is_some_and(|status| status.phase == ScriptExecutionPhase::Error)
-        });
-    if has_error {
+    if has_enabled_phase(|phase| phase == ScriptExecutionPhase::Error) {
         return (format!("{enabled_count} ERR"), BADGE_DANGER);
     }
-
     (format!("{enabled_count} ON"), BADGE_ACCENT)
 }
 
