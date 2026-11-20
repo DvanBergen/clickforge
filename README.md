@@ -52,6 +52,22 @@ Run the complete verification gate (release overflow-checks check, 800-line file
 ./scripts/verify_all.sh
 ```
 
+## Desktop Launcher Installation
+
+Install the release binary, scalable SVG icon, and XDG desktop entry for Linux application launchers (including Wayland launchers such as DMS Application Launcher):
+
+```bash
+./scripts/install_desktop_app.sh
+```
+
+The installer builds `target/release/clickforge` with `cargo build --release` when absent, then installs:
+
+- Binary: `${XDG_BIN_HOME:-~/.local/bin}/clickforge`
+- Icon: `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/scalable/apps/clickforge.svg`
+- Desktop entry: `${XDG_DATA_HOME:-~/.local/share}/applications/clickforge.desktop` (with `StartupWMClass=clickforge` matching `WAYLAND_APP_ID` in `src/main.rs`)
+
+When installed on the host, the script runs `desktop-file-validate`, refreshes the desktop database with `update-desktop-database`, and updates the hicolor icon cache if `index.theme` is present.
+
 ## Wayland, niri, and Steam Proton Targeting
 
 Under Wayland compositors such as `niri`, XWayland games launched through Steam Proton report the `xwayland-satellite` proxy PID as the window PID while exposing the window title and `app_id` (for example `steam_app_2560650` or `steam_app_default`).

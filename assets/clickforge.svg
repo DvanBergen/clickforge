@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>ClickForge</title>
+  <!-- Forge Slate rounded squircle base -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="#111317" stroke="#2A303C" stroke-width="3" />
+
+  <!-- Upper interlocked forge block -->
+  <path
+    d="M 28 26 H 35 L 38 31 H 50 L 53 26 H 64 Q 70 26 70 32 V 46 Q 70 52 64 52 H 53 L 50 58 H 38 L 35 52 H 28 Q 22 52 22 46 V 32 Q 22 26 28 26 Z"
+    fill="#20242D"
+    stroke="#4B566B"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+  />
+  <rect x="27" y="33" width="5" height="12" rx="2.5" fill="#E59A38" />
+
+  <!-- Lower interlocked forge block -->
+  <path
+    d="M 28 57 H 34 L 37 63 H 51 L 54 57 H 60 Q 66 57 66 63 V 84 Q 66 90 60 90 H 28 Q 22 90 22 84 V 63 Q 22 57 28 57 Z"
+    fill="#181B21"
+    stroke="#4B566B"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+  />
+  <rect x="27" y="67" width="5" height="14" rx="2.5" fill="#ECEFF4" />
+
+  <!-- Precision radial click sparks originating from cursor apex (62, 50) -->
+  <g fill="none" stroke="#E59A38" stroke-width="4" stroke-linecap="round">
+    <line x1="74" y1="35" x2="81" y2="26" />
+    <line x1="79" y1="42" x2="92" y2="37" />
+    <line x1="82" y1="51" x2="93" y2="52" />
+  </g>
+
+  <!-- Dark cutout halo separating cursor from forge blocks -->
+  <path
+    d="M 62 50 L 62 95 L 74 84 L 83 102 L 91 98 L 82 80 L 99 78 Z"
+    fill="#111317"
+    stroke="#111317"
+    stroke-width="8"
+    stroke-linejoin="round"
+  />
+
+  <!-- Precision amber-copper cursor with watertight forged chamfer -->
+  <path
+    d="M 62 50 L 62 95 L 74 84 L 83 102 L 91 98 L 82 80 L 99 78 Z"
+    fill="#E59A38"
+  />
+  <path
+    d="M 62 50 L 62 95 L 74 84 L 83 102 L 87 100 L 78 82 Z"
+    fill="#C97622"
+  />
+</svg>
