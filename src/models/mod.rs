@@ -19,6 +19,7 @@ pub use runtime_contracts::{
 pub use script::{ScriptDocument, ScriptMode};
 pub use target::{
     ActiveWindowSnapshot, GameTargetRule, RunningProcessEntry, TargetMatchMode, TargetScope,
+    correlate_process_for_window,
 };
 pub use validation::{
     ValidationError, ValidationIssue, ValidationIssueCode, ValidationReport,

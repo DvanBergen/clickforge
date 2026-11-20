@@ -1,2 +1,3 @@
-//! Placeholder module for the Linux StatusNotifierItem (`ksni`) system tray.
-//! Replaced by the `linux-input` implementation phase.
+pub mod system_tray;
+
+pub use system_tray::{SystemTrayHandle, build_status_tray_icon, spawn_system_tray};

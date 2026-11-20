@@ -67,13 +67,21 @@ pub struct ActiveWindowSnapshot {
 
 impl ActiveWindowSnapshot {
     /// Extracts the numeric Steam app ID when `app_id` uses the `steam_app_<id>` convention.
+    ///
+    /// Rejects non-numeric placeholders such as `steam_app_default` and `steam_app_0`.
     pub fn extracted_steam_app_id(&self) -> Option<&str> {
         let trimmed_app_id = self.app_id.trim();
         if trimmed_app_id.len() <= STEAM_APP_ID_PREFIX.len() {
             return None;
         }
         let (prefix, remainder) = trimmed_app_id.split_at(STEAM_APP_ID_PREFIX.len());
-        if !prefix.eq_ignore_ascii_case(STEAM_APP_ID_PREFIX) || remainder.is_empty() {
+        if !prefix.eq_ignore_ascii_case(STEAM_APP_ID_PREFIX) {
+            return None;
+        }
+        let is_non_zero_numeric = !remainder.is_empty()
+            && remainder.bytes().all(|byte| byte.is_ascii_digit())
+            && remainder.bytes().any(|byte| byte != b'0');
+        if !is_non_zero_numeric {
             return None;
         }
         Some(remainder)
@@ -132,10 +140,6 @@ impl GameTargetRule {
 
     /// Builds a target rule directly from a `/proc` process entry.
     pub fn from_process(process: &RunningProcessEntry, match_mode: TargetMatchMode) -> Self {
-        let app_id = process
-            .steam_app_id
-            .as_ref()
-            .map(|steam_id| format!("{STEAM_APP_ID_PREFIX}{steam_id}"));
         let executable_name = non_empty_trimmed(&process.executable_name)
             .or_else(|| non_empty_trimmed(&process.process_name));
         let display_name = executable_name
@@ -145,7 +149,7 @@ impl GameTargetRule {
         Self {
             display_name,
             match_mode,
-            app_id,
+            app_id: None,
             window_title_contains: None,
             executable_name,
             steam_app_id: process.steam_app_id.clone(),
@@ -357,7 +361,14 @@ fn matches_steam_app_id(
             .as_deref()
             .is_some_and(|steam_id| steam_id.eq_ignore_ascii_case(expected_steam_id));
     }
-    false
+    let is_proxy_or_missing_pid =
+        window.pid.is_none() || is_window_pid_xwayland_proxy(window, running_processes);
+    if !is_proxy_or_missing_pid {
+        return false;
+    }
+    correlate_process_for_window(window, running_processes)
+        .and_then(|entry| entry.steam_app_id.as_deref())
+        .is_some_and(|steam_id| steam_id.eq_ignore_ascii_case(expected_steam_id))
 }
 
 fn matches_executable_criterion(
@@ -407,7 +418,8 @@ fn matches_executable_criterion(
     has_window_identity_match || executable_correlates_with_window(target_executable, window)
 }
 
-fn correlate_process_for_window<'slice>(
+/// Correlates a desktop window with its underlying `/proc` process, resolving XWayland/Proton `.exe` entries.
+pub fn correlate_process_for_window<'slice>(
     window: &ActiveWindowSnapshot,
     running_processes: &'slice [RunningProcessEntry],
 ) -> Option<&'slice RunningProcessEntry> {
@@ -436,6 +448,13 @@ fn correlate_process_for_window<'slice>(
         }) {
             return Some(steam_match);
         }
+    }
+    if let Some(proton_title_match) = running_processes.iter().find(|entry| {
+        entry.is_wine_or_proton
+            && !entry.is_xwayland_proxy()
+            && executable_correlates_with_window(&entry.executable_name, window)
+    }) {
+        return Some(proton_title_match);
     }
     running_processes.iter().find(|entry| {
         !entry.is_xwayland_proxy()
@@ -598,5 +617,55 @@ mod tests {
         game_window.is_focused = false;
         assert!(!scope.matches_focused_window(Some(&game_window), &processes));
         assert!(TargetScope::Global.matches_focused_window(None, &processes));
+    }
+
+    #[test]
+    fn steam_app_default_and_from_process_match_proton_xwayland_windows() {
+        let processes = sample_proton_processes();
+        let default_app_window = ActiveWindowSnapshot {
+            window_id: Some(90),
+            title: "Here Comes the Horde".to_string(),
+            app_id: "steam_app_default".to_string(),
+            pid: Some(1200),
+            is_focused: true,
+            compositor_name: "niri".to_string(),
+        };
+        let zero_app_window = ActiveWindowSnapshot {
+            app_id: "steam_app_0".to_string(),
+            ..default_app_window.clone()
+        };
+        let numeric_app_window = ActiveWindowSnapshot {
+            app_id: "steam_app_2560650".to_string(),
+            ..default_app_window.clone()
+        };
+
+        assert_eq!(default_app_window.extracted_steam_app_id(), None);
+        assert_eq!(zero_app_window.extracted_steam_app_id(), None);
+        assert_eq!(numeric_app_window.extracted_steam_app_id(), Some("2560650"));
+
+        let persistent_rule = GameTargetRule::from_window_and_processes(
+            &default_app_window,
+            &processes,
+            TargetMatchMode::PersistentAppAndTitle,
+        );
+        assert_eq!(persistent_rule.steam_app_id.as_deref(), Some("2560650"));
+        assert_eq!(
+            persistent_rule.executable_name.as_deref(),
+            Some("HereComesTheHorde.exe")
+        );
+        assert!(persistent_rule.matches_window(&default_app_window, &processes));
+
+        let strict_rule = GameTargetRule::from_window_and_processes(
+            &default_app_window,
+            &processes,
+            TargetMatchMode::StrictPid,
+        );
+        assert!(strict_rule.matches_window(&default_app_window, &processes));
+
+        let process_rule =
+            GameTargetRule::from_process(&processes[1], TargetMatchMode::PersistentAppAndTitle);
+        assert_eq!(process_rule.app_id, None);
+        assert!(process_rule.matches_window(&default_app_window, &processes));
+        assert!(process_rule.matches_window(&numeric_app_window, &processes));
     }
 }
