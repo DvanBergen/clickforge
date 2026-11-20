@@ -1,26 +1,44 @@
+mod geometry;
+
 use egui::{
-    Align, Button, Color32, CornerRadius, Frame, Layout, Margin, Painter, Pos2, Rect, RichText,
-    Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+    Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Margin, PointerButton,
+    Popup, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
 use crate::models::{BlockId, BlockSlotTarget, StatementBlock, StatementKind, ValidationReport};
-use crate::ui::block_field_editors::{render_container_header_fields, render_leaf_inline_fields};
+use crate::ui::block_field_editors::{render_container_block_sentence, render_leaf_block_sentence};
 use crate::ui::block_palette::{BlockDragPayload, BlockDragState};
 use crate::ui::theme::{
-    ACCENT_PRIMARY, BG_CANVAS, BORDER_STRONG, BORDER_SUBTLE, CORNER_RADIUS_SM_PX,
-    FONT_SIZE_BODY_PX, FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_TINT, STATUS_RUNNING,
-    STATUS_RUNNING_TINT, SURFACE_ELEVATED, SURFACE_HOVER, TEXT_MUTED, TEXT_PRIMARY, category_color,
+    ACCENT_PRIMARY, ACCENT_PRIMARY_TINT, BORDER_SUBTLE, BlockVisualColors, CORNER_RADIUS_SM_PX,
+    FONT_SIZE_SMALL_PX, STATUS_DANGER, STATUS_DANGER_INK, STATUS_DANGER_SOLID, STATUS_DANGER_TINT,
+    STATUS_RUNNING, STATUS_RUNNING_TINT, TEXT_MUTED, TEXT_PRIMARY, block_visual_colors,
+    font_family_semibold, rich_semibold,
 };
 
-const BLOCK_STRIPE_WIDTH_PX: f32 = 5.0;
-const PUZZLE_NOTCH_OFFSET_X_PX: f32 = 24.0;
-const PUZZLE_NOTCH_WIDTH_PX: f32 = 24.0;
-const PUZZLE_NOTCH_DEPTH_PX: f32 = 4.0;
-const C_BLOCK_SPINE_WIDTH_PX: f32 = 14.0;
-const C_BLOCK_CHILD_INDENT_PX: f32 = 20.0;
-const C_BLOCK_FOOTER_HEIGHT_PX: f32 = 16.0;
-const BLOCK_VERTICAL_GAP_PX: f32 = 6.0;
-const EMPTY_SLOT_HEIGHT_PX: f32 = 30.0;
+pub(crate) use geometry::{
+    FULL_BLOCK_GEOMETRY, MINI_BLOCK_GEOMETRY, build_leaf_block_shapes, build_trigger_hat_shapes,
+};
+
+use geometry::{
+    C_BLOCK_SPINE_WIDTH_PX, build_c_block_shapes, paint_close_icon, paint_dashed_rect_border,
+    paint_duplicate_icon, with_alpha,
+};
+
+pub(crate) const BLOCK_MIN_WIDTH_PX: f32 = 280.0;
+pub(crate) const BLOCK_MAX_WIDTH_PX: f32 = 740.0;
+
+const NESTED_BLOCK_MIN_WIDTH_PX: f32 = 248.0;
+const C_BLOCK_FOOTER_HEIGHT_PX: f32 = 22.0;
+const C_BLOCK_ELSE_MIN_HEIGHT_PX: f32 = 28.0;
+const C_BLOCK_MIN_FOOTER_WIDTH_PX: f32 = 220.0;
+const C_BLOCK_MAX_FOOTER_WIDTH_PX: f32 = 340.0;
+const BLOCK_VERTICAL_GAP_PX: f32 = 0.0;
+const EMPTY_POCKET_HEIGHT_PX: f32 = 34.0;
+const EMPTY_ROOT_HEIGHT_PX: f32 = 46.0;
+const DRAG_DIM_OPACITY: f32 = 0.30;
+const HOVER_ACTION_SIZE_PX: f32 = 20.0;
+const HOVER_ACTION_GAP_PX: f32 = 4.0;
+const HOVER_RIGHT_RESERVE_PX: i8 = 54;
 
 /// Deferred structural tree mutation emitted while rendering statement blocks.
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +47,10 @@ pub enum BlockRenderMutation {
     MoveBlock {
         block_id: BlockId,
         target_slot: BlockSlotTarget,
+    },
+    DuplicateBlock {
+        block_id: BlockId,
+        insert_slot: BlockSlotTarget,
     },
     DeleteBlock(BlockId),
 }
@@ -40,373 +62,327 @@ pub struct BlockRenderContext<'frame> {
     pub pointer_pos: Option<Pos2>,
 }
 
-/// Renders a list of statement blocks and nested C-block branches with magnetic drop slots.
+struct BlockNavigationSlots {
+    move_up_slot: Option<BlockSlotTarget>,
+    move_down_slot: Option<BlockSlotTarget>,
+    duplicate_slot: BlockSlotTarget,
+}
+
+/// Renders a snapped stack of statement blocks and nested C-block branches with magnetic drop slots.
 pub fn render_statement_stack(
     ui: &mut Ui,
     statements: &mut [StatementBlock],
     slot_for_index: impl Fn(usize) -> BlockSlotTarget + Copy,
+    nesting_depth: usize,
     render_context: &BlockRenderContext<'_>,
     drag_state: &mut BlockDragState,
     mutations: &mut Vec<BlockRenderMutation>,
 ) {
-    let stack_min_x_px = ui.cursor().min.x;
-    let stack_max_x_px = stack_min_x_px + ui.available_width().max(260.0);
+    ui.spacing_mut().item_spacing.y = BLOCK_VERTICAL_GAP_PX;
+    let min_x_px = ui.cursor().min.x;
+    let clamped_width_px = ui
+        .available_width()
+        .clamp(NESTED_BLOCK_MIN_WIDTH_PX, BLOCK_MAX_WIDTH_PX);
+    let max_x_px = min_x_px + clamped_width_px;
 
     if statements.is_empty() {
-        render_empty_child_slot(
+        render_empty_drop_pocket(
             ui,
             slot_for_index(0),
-            stack_min_x_px,
-            stack_max_x_px,
+            nesting_depth,
             render_context.pointer_pos,
             drag_state,
         );
         return;
     }
 
-    if let Some(pointer_pos) = render_context.pointer_pos {
-        let top_slot_y_px = ui.cursor().min.y;
+    if let Some(pointer) = render_context.pointer_pos {
         drag_state.offer_slot_candidate(
-            pointer_pos,
+            pointer,
             slot_for_index(0),
-            top_slot_y_px,
-            stack_min_x_px,
-            stack_max_x_px,
+            ui.cursor().min.y,
+            min_x_px,
+            max_x_px,
+            nesting_depth,
         );
     }
 
     let statement_count = statements.len();
     for (block_index, block) in statements.iter_mut().enumerate() {
-        let can_move_up = block_index > 0;
-        let can_move_down = block_index.saturating_add(1) < statement_count;
-        let move_up_slot = can_move_up.then(|| slot_for_index(block_index.saturating_sub(1)));
-        let move_down_slot = can_move_down.then(|| slot_for_index(block_index.saturating_add(2)));
+        let navigation_slots = BlockNavigationSlots {
+            move_up_slot: (block_index > 0).then(|| slot_for_index(block_index.saturating_sub(1))),
+            move_down_slot: (block_index.saturating_add(1) < statement_count)
+                .then(|| slot_for_index(block_index.saturating_add(2))),
+            duplicate_slot: slot_for_index(block_index.saturating_add(1)),
+        };
 
-        render_single_block(
-            ui,
-            block,
-            move_up_slot,
-            move_down_slot,
-            render_context,
-            drag_state,
-            mutations,
-        );
+        let is_dragged = drag_state.dragged_existing_block_id() == Some(block.id);
+        ui.scope(|ui| {
+            if is_dragged {
+                ui.multiply_opacity(DRAG_DIM_OPACITY);
+            }
+            render_statement_node(
+                ui,
+                block,
+                navigation_slots,
+                nesting_depth,
+                render_context,
+                drag_state,
+                mutations,
+            );
+        });
 
-        ui.add_space(BLOCK_VERTICAL_GAP_PX);
-
-        if let Some(pointer_pos) = render_context.pointer_pos {
-            let after_slot_y_px = ui.cursor().min.y - (BLOCK_VERTICAL_GAP_PX * 0.5);
+        if let Some(pointer) = render_context.pointer_pos {
             drag_state.offer_slot_candidate(
-                pointer_pos,
+                pointer,
                 slot_for_index(block_index.saturating_add(1)),
-                after_slot_y_px,
-                stack_min_x_px,
-                stack_max_x_px,
+                ui.cursor().min.y,
+                min_x_px,
+                max_x_px,
+                nesting_depth,
             );
         }
     }
 }
 
-fn render_empty_child_slot(
+fn render_empty_drop_pocket(
     ui: &mut Ui,
     target_slot: BlockSlotTarget,
-    min_x_px: f32,
-    max_x_px: f32,
+    nesting_depth: usize,
     pointer_pos: Option<Pos2>,
     drag_state: &mut BlockDragState,
 ) {
-    let slot_width_px = (max_x_px - min_x_px).max(200.0);
-    let (slot_rect, _) =
-        ui.allocate_exact_size(vec2(slot_width_px, EMPTY_SLOT_HEIGHT_PX), Sense::hover());
-
-    let border_color = if drag_state.is_dragging_statement() {
-        ACCENT_PRIMARY
-    } else {
-        BORDER_SUBTLE
-    };
-    ui.painter().rect(
-        slot_rect,
-        CornerRadius::same(CORNER_RADIUS_SM_PX),
-        BG_CANVAS,
-        Stroke::new(1.0, border_color),
-        StrokeKind::Inside,
+    let is_root = nesting_depth == 0;
+    let pocket_size = vec2(
+        if is_root { 360.0 } else { 236.0 },
+        if is_root {
+            EMPTY_ROOT_HEIGHT_PX
+        } else {
+            EMPTY_POCKET_HEIGHT_PX
+        },
     );
-    ui.painter().text(
-        slot_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Drop block here",
-        egui::FontId::proportional(FONT_SIZE_SMALL_PX),
-        TEXT_MUTED,
-    );
+    ui.add_space(if is_root { 10.0 } else { 8.0 });
+    let (pocket_rect, _) = ui.allocate_exact_size(pocket_size, Sense::hover());
+    ui.add_space(6.0);
 
     if let Some(pointer) = pointer_pos {
         drag_state.offer_slot_candidate(
             pointer,
             target_slot,
-            slot_rect.center().y,
-            slot_rect.min.x,
-            slot_rect.max.x,
+            pocket_rect.center().y,
+            pocket_rect.min.x,
+            pocket_rect.max.x,
+            nesting_depth,
         );
     }
+
+    let is_target = drag_state
+        .hovered_slot
+        .is_some_and(|slot| slot.target_slot == target_slot);
+    let (fill_color, border_color, text_color) = if is_target {
+        (ACCENT_PRIMARY_TINT, ACCENT_PRIMARY, ACCENT_PRIMARY)
+    } else if drag_state.is_dragging_statement() {
+        (
+            Color32::from_rgba_unmultiplied(0x28, 0x22, 0x16, 175),
+            with_alpha(ACCENT_PRIMARY, 165),
+            TEXT_PRIMARY,
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(0x18, 0x1C, 0x24, 150),
+            BORDER_SUBTLE,
+            TEXT_MUTED,
+        )
+    };
+
+    ui.painter().rect_filled(
+        pocket_rect,
+        CornerRadius::same(CORNER_RADIUS_SM_PX),
+        fill_color,
+    );
+    paint_dashed_rect_border(
+        ui.painter(),
+        pocket_rect,
+        Stroke::new(if is_target { 1.5 } else { 1.0 }, border_color),
+    );
+    let prompt = if is_root {
+        "Drag blocks from the palette or click a block to add"
+    } else {
+        "Drop blocks here"
+    };
+    ui.painter().text(
+        pocket_rect.center(),
+        Align2::CENTER_CENTER,
+        prompt,
+        FontId::new(FONT_SIZE_SMALL_PX, font_family_semibold()),
+        text_color,
+    );
 }
 
-fn render_single_block(
+fn render_statement_node(
     ui: &mut Ui,
     block: &mut StatementBlock,
-    move_up_slot: Option<BlockSlotTarget>,
-    move_down_slot: Option<BlockSlotTarget>,
+    navigation_slots: BlockNavigationSlots,
+    nesting_depth: usize,
     render_context: &BlockRenderContext<'_>,
     drag_state: &mut BlockDragState,
     mutations: &mut Vec<BlockRenderMutation>,
 ) {
-    let is_container = matches!(
-        block.kind,
+    let block_id = block.id;
+    let is_container = is_container_kind(&block.kind);
+    let visual_colors = block_visual_colors(block.kind.category());
+    let is_active = render_context.active_block_id == Some(block_id);
+    let validation_message =
+        find_block_validation_message(render_context.validation_report, block_id);
+    let min_width_px = if nesting_depth == 0 {
+        BLOCK_MIN_WIDTH_PX
+    } else {
+        NESTED_BLOCK_MIN_WIDTH_PX
+    };
+    let background_shape_index = ui.painter().add(Shape::Noop);
+
+    let header_response = ui
+        .scope_builder(
+            UiBuilder::new()
+                .id_salt(("block_body_drag", block_id.0))
+                .sense(Sense::click_and_drag()),
+            |ui| {
+                Frame::NONE
+                    .inner_margin(Margin {
+                        left: 10,
+                        right: HOVER_RIGHT_RESERVE_PX,
+                        top: (FULL_BLOCK_GEOMETRY.notch_depth_px as i8) + 5,
+                        bottom: 7,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(min_width_px);
+                        ui.set_max_width(BLOCK_MAX_WIDTH_PX);
+                        ui.horizontal_wrapped(|ui| {
+                            paint_subtle_grip_dots(ui, visual_colors.text_muted);
+                            let did_edit = if is_container {
+                                render_container_block_sentence(
+                                    ui,
+                                    block_id,
+                                    &mut block.kind,
+                                    visual_colors,
+                                )
+                            } else {
+                                render_leaf_block_sentence(
+                                    ui,
+                                    block_id,
+                                    &mut block.kind,
+                                    visual_colors,
+                                )
+                            };
+                            if did_edit {
+                                mutations.push(BlockRenderMutation::MarkDirty);
+                            }
+                        });
+                    });
+            },
+        )
+        .response;
+
+    let header_rect = header_response.rect;
+    let is_hovered = !drag_state.is_dragging() && header_response.contains_pointer();
+    let (fill_color, border_color, stroke_width_px) = resolve_block_surface_colors(
+        visual_colors,
+        is_active,
+        validation_message.is_some(),
+        is_hovered,
+    );
+
+    let shapes = if is_container {
+        let footer_width_px = header_rect
+            .width()
+            .clamp(C_BLOCK_MIN_FOOTER_WIDTH_PX, C_BLOCK_MAX_FOOTER_WIDTH_PX);
+        let else_rect = render_container_branches(
+            ui,
+            block_id,
+            &mut block.kind,
+            footer_width_px,
+            visual_colors,
+            nesting_depth.saturating_add(1),
+            render_context,
+            drag_state,
+            mutations,
+        );
+        let (footer_rect, _) = ui.allocate_exact_size(
+            vec2(footer_width_px, C_BLOCK_FOOTER_HEIGHT_PX),
+            Sense::hover(),
+        );
+        build_c_block_shapes(
+            header_rect,
+            else_rect,
+            footer_rect,
+            fill_color,
+            border_color,
+            visual_colors.top_highlight,
+            stroke_width_px,
+        )
+    } else {
+        build_leaf_block_shapes(
+            header_rect,
+            FULL_BLOCK_GEOMETRY,
+            fill_color,
+            border_color,
+            visual_colors.top_highlight,
+            stroke_width_px,
+            true,
+            true,
+        )
+    };
+    ui.painter().set(background_shape_index, Shape::Vec(shapes));
+
+    handle_block_drag_and_menu(
+        ui,
+        &header_response,
+        header_rect,
+        block,
+        &navigation_slots,
+        validation_message,
+        drag_state,
+        mutations,
+    );
+}
+
+fn is_container_kind(statement_kind: &StatementKind) -> bool {
+    matches!(
+        statement_kind,
         StatementKind::IfThen { .. }
             | StatementKind::IfThenElse { .. }
             | StatementKind::WhileCondition { .. }
             | StatementKind::RepeatCount { .. }
-    );
-    if is_container {
-        render_c_container_block(
-            ui,
-            block,
-            move_up_slot,
-            move_down_slot,
-            render_context,
-            drag_state,
-            mutations,
-        );
-    } else {
-        render_leaf_statement_block(
-            ui,
-            block,
-            move_up_slot,
-            move_down_slot,
-            render_context,
-            drag_state,
-            mutations,
-        );
-    }
+    )
 }
 
-fn render_leaf_statement_block(
-    ui: &mut Ui,
-    block: &mut StatementBlock,
-    move_up_slot: Option<BlockSlotTarget>,
-    move_down_slot: Option<BlockSlotTarget>,
-    render_context: &BlockRenderContext<'_>,
-    drag_state: &mut BlockDragState,
-    mutations: &mut Vec<BlockRenderMutation>,
-) {
-    let block_id = block.id;
-    let accent_color = category_color(block.kind.category());
-    let is_active = render_context.active_block_id == Some(block_id);
-    let validation_message =
-        find_block_validation_message(render_context.validation_report, block_id);
-    let is_dragged_source = drag_state.dragged_existing_block_id() == Some(block_id);
-
-    let fill_color = resolve_block_fill(is_active, validation_message.is_some(), is_dragged_source);
-    let stroke = resolve_block_stroke(is_active, validation_message.is_some());
-
-    let frame_response = Frame::NONE
-        .fill(fill_color)
-        .stroke(stroke)
-        .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
-        .inner_margin(Margin {
-            left: 12,
-            right: 8,
-            top: 7,
-            bottom: 7,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                render_block_drag_handle(
-                    ui,
-                    block_id,
-                    block.kind.title(),
-                    accent_color,
-                    drag_state,
-                );
-                ui.label(
-                    RichText::new(block.kind.title())
-                        .size(FONT_SIZE_BODY_PX)
-                        .strong()
-                        .color(TEXT_PRIMARY),
-                );
-                if render_leaf_inline_fields(ui, block_id, &mut block.kind) {
-                    mutations.push(BlockRenderMutation::MarkDirty);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    render_block_toolbar_buttons(
-                        ui,
-                        block_id,
-                        move_up_slot,
-                        move_down_slot,
-                        mutations,
-                    );
-                });
-            });
-        });
-
-    paint_notched_puzzle_chrome(
-        ui.painter(),
-        frame_response.response.rect,
-        accent_color,
-        true,
-        true,
-    );
-
-    if let Some(error_text) = validation_message {
-        frame_response.response.on_hover_text(error_text);
-    }
-}
-
-fn render_c_container_block(
-    ui: &mut Ui,
-    block: &mut StatementBlock,
-    move_up_slot: Option<BlockSlotTarget>,
-    move_down_slot: Option<BlockSlotTarget>,
-    render_context: &BlockRenderContext<'_>,
-    drag_state: &mut BlockDragState,
-    mutations: &mut Vec<BlockRenderMutation>,
-) {
-    let block_id = block.id;
-    let accent_color = category_color(block.kind.category());
-    let is_active = render_context.active_block_id == Some(block_id);
-    let validation_message =
-        find_block_validation_message(render_context.validation_report, block_id);
-    let is_dragged_source = drag_state.dragged_existing_block_id() == Some(block_id);
-
-    let fill_color = resolve_block_fill(is_active, validation_message.is_some(), is_dragged_source);
-    let stroke = resolve_block_stroke(is_active, validation_message.is_some());
-    let container_left_x_px = ui.cursor().min.x;
-
-    let header_response = Frame::NONE
-        .fill(fill_color)
-        .stroke(stroke)
-        .corner_radius(CornerRadius {
-            nw: CORNER_RADIUS_SM_PX,
-            ne: CORNER_RADIUS_SM_PX,
-            sw: 0,
-            se: CORNER_RADIUS_SM_PX,
-        })
-        .inner_margin(Margin {
-            left: 12,
-            right: 8,
-            top: 7,
-            bottom: 7,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                render_block_drag_handle(
-                    ui,
-                    block_id,
-                    block.kind.title(),
-                    accent_color,
-                    drag_state,
-                );
-                ui.label(
-                    RichText::new(block.kind.title())
-                        .size(FONT_SIZE_BODY_PX)
-                        .strong()
-                        .color(TEXT_PRIMARY),
-                );
-                if render_container_header_fields(ui, block_id, &mut block.kind) {
-                    mutations.push(BlockRenderMutation::MarkDirty);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    render_block_toolbar_buttons(
-                        ui,
-                        block_id,
-                        move_up_slot,
-                        move_down_slot,
-                        mutations,
-                    );
-                });
-            });
-        });
-
-    let header_rect = header_response.response.rect;
-    paint_notched_puzzle_chrome(ui.painter(), header_rect, accent_color, true, false);
-
-    render_container_branches(
-        ui,
-        block_id,
-        &mut block.kind,
-        (accent_color, stroke),
-        render_context,
-        drag_state,
-        mutations,
-    );
-
-    let footer_width_px = ui.available_width().max(220.0);
-    let (footer_rect, _) = ui.allocate_exact_size(
-        vec2(footer_width_px, C_BLOCK_FOOTER_HEIGHT_PX),
-        Sense::hover(),
-    );
-    ui.painter().rect(
-        footer_rect,
-        CornerRadius {
-            nw: 0,
-            ne: CORNER_RADIUS_SM_PX,
-            sw: CORNER_RADIUS_SM_PX,
-            se: CORNER_RADIUS_SM_PX,
-        },
-        fill_color,
-        stroke,
-        StrokeKind::Inside,
-    );
-
-    let spine_rect = Rect::from_min_max(
-        pos2(container_left_x_px, header_rect.max.y - 1.0),
-        pos2(
-            container_left_x_px + C_BLOCK_SPINE_WIDTH_PX,
-            footer_rect.max.y,
-        ),
-    );
-    ui.painter().rect_filled(
-        spine_rect,
-        CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: CORNER_RADIUS_SM_PX,
-            se: 0,
-        },
-        accent_color,
-    );
-
-    paint_bottom_puzzle_tab(ui.painter(), footer_rect, accent_color);
-
-    if let Some(error_text) = validation_message {
-        header_response.response.on_hover_text(error_text);
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn render_container_branches(
     ui: &mut Ui,
     parent_block_id: BlockId,
     statement_kind: &mut StatementKind,
-    divider_style: (Color32, Stroke),
+    bridge_width_px: f32,
+    visual_colors: BlockVisualColors,
+    child_depth: usize,
     render_context: &BlockRenderContext<'_>,
     drag_state: &mut BlockDragState,
     mutations: &mut Vec<BlockRenderMutation>,
-) {
-    let (accent_color, stroke) = divider_style;
+) -> Option<Rect> {
     match statement_kind {
         StatementKind::IfThen { then_blocks, .. } => {
             render_indented_branch(
                 ui,
                 then_blocks,
-                |slot_index| BlockSlotTarget::ThenBranch {
+                |insert_index| BlockSlotTarget::ThenBranch {
                     parent_block_id,
-                    insert_index: slot_index,
+                    insert_index,
                 },
+                child_depth,
                 render_context,
                 drag_state,
                 mutations,
             );
+            None
         }
         StatementKind::IfThenElse {
             then_blocks,
@@ -416,42 +392,47 @@ fn render_container_branches(
             render_indented_branch(
                 ui,
                 then_blocks,
-                |slot_index| BlockSlotTarget::ThenBranch {
+                |insert_index| BlockSlotTarget::ThenBranch {
                     parent_block_id,
-                    insert_index: slot_index,
+                    insert_index,
                 },
+                child_depth,
                 render_context,
                 drag_state,
                 mutations,
             );
-            render_else_divider_bar(ui, accent_color, stroke);
+            let else_rect = render_else_bridge_label(ui, bridge_width_px, visual_colors);
             render_indented_branch(
                 ui,
                 else_blocks,
-                |slot_index| BlockSlotTarget::ElseBranch {
+                |insert_index| BlockSlotTarget::ElseBranch {
                     parent_block_id,
-                    insert_index: slot_index,
+                    insert_index,
                 },
+                child_depth,
                 render_context,
                 drag_state,
                 mutations,
             );
+            Some(else_rect)
         }
         StatementKind::WhileCondition { body_blocks, .. }
         | StatementKind::RepeatCount { body_blocks, .. } => {
             render_indented_branch(
                 ui,
                 body_blocks,
-                |slot_index| BlockSlotTarget::LoopBody {
+                |insert_index| BlockSlotTarget::LoopBody {
                     parent_block_id,
-                    insert_index: slot_index,
+                    insert_index,
                 },
+                child_depth,
                 render_context,
                 drag_state,
                 mutations,
             );
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -459,182 +440,267 @@ fn render_indented_branch(
     ui: &mut Ui,
     child_blocks: &mut [StatementBlock],
     slot_for_index: impl Fn(usize) -> BlockSlotTarget + Copy,
+    child_depth: usize,
     render_context: &BlockRenderContext<'_>,
     drag_state: &mut BlockDragState,
     mutations: &mut Vec<BlockRenderMutation>,
 ) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(C_BLOCK_CHILD_INDENT_PX);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(C_BLOCK_SPINE_WIDTH_PX);
         ui.vertical(|ui| {
-            ui.set_width(ui.available_width());
             render_statement_stack(
                 ui,
                 child_blocks,
                 slot_for_index,
+                child_depth,
                 render_context,
                 drag_state,
                 mutations,
             );
         });
     });
-    ui.add_space(4.0);
 }
 
-fn render_else_divider_bar(ui: &mut Ui, accent_color: Color32, stroke: Stroke) {
-    Frame::NONE
-        .fill(SURFACE_ELEVATED)
-        .stroke(stroke)
-        .corner_radius(CornerRadius {
-            nw: 0,
-            ne: CORNER_RADIUS_SM_PX,
-            sw: 0,
-            se: CORNER_RADIUS_SM_PX,
-        })
-        .inner_margin(Margin {
-            left: 20,
-            right: 8,
-            top: 3,
-            bottom: 3,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new("Else")
-                    .size(FONT_SIZE_SMALL_PX)
-                    .strong()
-                    .color(accent_color),
-            );
-        });
-}
-
-fn render_block_drag_handle(
+fn render_else_bridge_label(
     ui: &mut Ui,
-    block_id: BlockId,
-    block_title: &str,
-    accent_color: Color32,
+    bridge_width_px: f32,
+    visual_colors: BlockVisualColors,
+) -> Rect {
+    let (bridge_rect, _) = ui.allocate_exact_size(
+        vec2(bridge_width_px, C_BLOCK_ELSE_MIN_HEIGHT_PX),
+        Sense::hover(),
+    );
+    let notch_px = FULL_BLOCK_GEOMETRY.notch_depth_px;
+    let label_y_px = bridge_rect.min.y + notch_px + (C_BLOCK_ELSE_MIN_HEIGHT_PX - notch_px) * 0.5;
+    ui.painter().text(
+        pos2(
+            bridge_rect.min.x + C_BLOCK_SPINE_WIDTH_PX + 10.0,
+            label_y_px,
+        ),
+        Align2::LEFT_CENTER,
+        "Else",
+        FontId::new(FONT_SIZE_SMALL_PX, font_family_semibold()),
+        visual_colors.text_primary,
+    );
+    bridge_rect
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_block_drag_and_menu(
+    ui: &mut Ui,
+    header_response: &Response,
+    header_rect: Rect,
+    block: &StatementBlock,
+    navigation_slots: &BlockNavigationSlots,
+    validation_message: Option<&str>,
     drag_state: &mut BlockDragState,
-) {
-    let (grip_rect, grip_response) =
-        ui.allocate_exact_size(vec2(16.0, 20.0), Sense::click_and_drag());
-    let dot_color = if grip_response.hovered() {
-        ACCENT_PRIMARY
-    } else {
-        TEXT_MUTED
-    };
-    let center_x_px = grip_rect.center().x;
-    let center_y_px = grip_rect.center().y;
-    for row_offset_px in [-4.0_f32, 0.0, 4.0] {
-        ui.painter().circle_filled(
-            pos2(center_x_px - 2.5, center_y_px + row_offset_px),
-            1.2,
-            dot_color,
-        );
-        ui.painter().circle_filled(
-            pos2(center_x_px + 2.5, center_y_px + row_offset_px),
-            1.2,
-            dot_color,
-        );
-    }
-
-    if grip_response
-        .on_hover_text("Drag to reorder or nest block")
-        .drag_started()
-    {
-        drag_state.start_drag(
-            BlockDragPayload::MoveExistingBlock(block_id),
-            block_title,
-            accent_color,
-        );
-    }
-}
-
-fn render_block_toolbar_buttons(
-    ui: &mut Ui,
-    block_id: BlockId,
-    move_up_slot: Option<BlockSlotTarget>,
-    move_down_slot: Option<BlockSlotTarget>,
     mutations: &mut Vec<BlockRenderMutation>,
 ) {
-    let delete_button = Button::new(
-        RichText::new("x")
-            .size(FONT_SIZE_SMALL_PX)
-            .color(STATUS_DANGER),
-    )
-    .fill(Color32::TRANSPARENT)
-    .stroke(Stroke::new(1.0, BORDER_SUBTLE));
-    if ui
-        .add(delete_button)
-        .on_hover_text("Delete block")
-        .clicked()
-    {
+    let is_popup_open = Popup::is_any_open(ui.ctx());
+    let is_hovered = !drag_state.is_dragging() && header_response.contains_pointer();
+    if !is_popup_open && header_response.hovered() && !drag_state.is_dragging() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    }
+    if !is_popup_open && header_response.drag_started_by(PointerButton::Primary) {
+        drag_state.start_drag(
+            BlockDragPayload::MoveExistingBlock(block.id),
+            block.kind.title(),
+            summarize_statement_for_ghost(&block.kind),
+            block.kind.category(),
+        );
+    }
+
+    if is_hovered {
+        render_hover_trailing_actions(
+            ui,
+            header_rect,
+            block.id,
+            navigation_slots.duplicate_slot,
+            mutations,
+        );
+    } else if let Some(error_text) = validation_message {
+        paint_validation_warning_dot(ui, header_rect, error_text);
+    }
+
+    header_response.container_context_menu(|ui| {
+        render_block_context_menu(ui, block.id, navigation_slots, mutations);
+    });
+}
+
+fn render_hover_trailing_actions(
+    ui: &mut Ui,
+    header_rect: Rect,
+    block_id: BlockId,
+    duplicate_slot: BlockSlotTarget,
+    mutations: &mut Vec<BlockRenderMutation>,
+) {
+    let notch_px = FULL_BLOCK_GEOMETRY.notch_depth_px;
+    let center_y_px = header_rect.min.y + notch_px + (header_rect.height() - notch_px) * 0.5;
+    let button_size = vec2(HOVER_ACTION_SIZE_PX, HOVER_ACTION_SIZE_PX);
+    let delete_rect =
+        Rect::from_center_size(pos2(header_rect.max.x - 16.0, center_y_px), button_size);
+    let duplicate_center_x = delete_rect.min.x - HOVER_ACTION_GAP_PX - (HOVER_ACTION_SIZE_PX * 0.5);
+    let duplicate_rect = Rect::from_center_size(pos2(duplicate_center_x, center_y_px), button_size);
+
+    let idle_fill = Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 76);
+    let duplicate_response = ui
+        .interact(
+            duplicate_rect,
+            Id::unique(("blk_dup", block_id.0)),
+            Sense::click_and_drag(),
+        )
+        .on_hover_text("Duplicate block");
+    let duplicate_fill = if duplicate_response.hovered() {
+        Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 44)
+    } else {
+        idle_fill
+    };
+    ui.painter().rect_filled(
+        duplicate_rect,
+        CornerRadius::same(CORNER_RADIUS_SM_PX),
+        duplicate_fill,
+    );
+    paint_duplicate_icon(ui.painter(), duplicate_rect.center(), TEXT_PRIMARY);
+    if duplicate_response.clicked() {
+        mutations.push(BlockRenderMutation::DuplicateBlock {
+            block_id,
+            insert_slot: duplicate_slot,
+        });
+    }
+
+    let delete_response = ui
+        .interact(
+            delete_rect,
+            Id::unique(("blk_del", block_id.0)),
+            Sense::click_and_drag(),
+        )
+        .on_hover_text("Delete block");
+    let (delete_fill, delete_ink) = if delete_response.hovered() {
+        (STATUS_DANGER_SOLID, TEXT_PRIMARY)
+    } else {
+        (idle_fill, STATUS_DANGER_INK)
+    };
+    ui.painter().rect_filled(
+        delete_rect,
+        CornerRadius::same(CORNER_RADIUS_SM_PX),
+        delete_fill,
+    );
+    paint_close_icon(ui.painter(), delete_rect.center(), delete_ink);
+    if delete_response.clicked() {
         mutations.push(BlockRenderMutation::DeleteBlock(block_id));
     }
+}
 
-    let down_button = Button::new(
-        RichText::new("v")
-            .size(FONT_SIZE_SMALL_PX)
-            .color(TEXT_MUTED),
-    )
-    .fill(Color32::TRANSPARENT)
-    .stroke(Stroke::new(1.0, BORDER_SUBTLE));
-    if ui
-        .add_enabled(move_down_slot.is_some(), down_button)
-        .on_hover_text("Move block down")
-        .clicked()
-        && let Some(target_slot) = move_down_slot
-    {
-        mutations.push(BlockRenderMutation::MoveBlock {
+fn render_block_context_menu(
+    ui: &mut Ui,
+    block_id: BlockId,
+    navigation_slots: &BlockNavigationSlots,
+    mutations: &mut Vec<BlockRenderMutation>,
+) {
+    ui.set_min_width(148.0);
+    if add_menu_item(ui, "Duplicate Block", TEXT_PRIMARY, true) {
+        mutations.push(BlockRenderMutation::DuplicateBlock {
             block_id,
-            target_slot,
+            insert_slot: navigation_slots.duplicate_slot,
         });
+        ui.close();
     }
-
-    let up_button = Button::new(
-        RichText::new("^")
-            .size(FONT_SIZE_SMALL_PX)
-            .color(TEXT_MUTED),
-    )
-    .fill(Color32::TRANSPARENT)
-    .stroke(Stroke::new(1.0, BORDER_SUBTLE));
-    if ui
-        .add_enabled(move_up_slot.is_some(), up_button)
-        .on_hover_text("Move block up")
-        .clicked()
-        && let Some(target_slot) = move_up_slot
+    if add_menu_item(
+        ui,
+        "Move Up",
+        TEXT_PRIMARY,
+        navigation_slots.move_up_slot.is_some(),
+    ) && let Some(target_slot) = navigation_slots.move_up_slot
     {
         mutations.push(BlockRenderMutation::MoveBlock {
             block_id,
             target_slot,
         });
+        ui.close();
+    }
+    if add_menu_item(
+        ui,
+        "Move Down",
+        TEXT_PRIMARY,
+        navigation_slots.move_down_slot.is_some(),
+    ) && let Some(target_slot) = navigation_slots.move_down_slot
+    {
+        mutations.push(BlockRenderMutation::MoveBlock {
+            block_id,
+            target_slot,
+        });
+        ui.close();
+    }
+    ui.separator();
+    if add_menu_item(ui, "Delete Block", STATUS_DANGER_INK, true) {
+        mutations.push(BlockRenderMutation::DeleteBlock(block_id));
+        ui.close();
     }
 }
 
-fn resolve_block_fill(
+fn add_menu_item(ui: &mut Ui, label: &str, color: Color32, is_enabled: bool) -> bool {
+    ui.add_enabled(
+        is_enabled,
+        Button::new(rich_semibold(label, FONT_SIZE_SMALL_PX, color)).frame(false),
+    )
+    .clicked()
+}
+
+fn paint_subtle_grip_dots(ui: &mut Ui, dot_base_color: Color32) {
+    let (grip_rect, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
+    let dot_color = with_alpha(dot_base_color, 130);
+    let center = grip_rect.center();
+    for offset_y_px in [-4.0_f32, 0.0, 4.0] {
+        ui.painter()
+            .circle_filled(pos2(center.x - 2.0, center.y + offset_y_px), 1.1, dot_color);
+        ui.painter()
+            .circle_filled(pos2(center.x + 2.0, center.y + offset_y_px), 1.1, dot_color);
+    }
+}
+
+fn paint_validation_warning_dot(ui: &mut Ui, header_rect: Rect, error_text: &str) {
+    let notch_px = FULL_BLOCK_GEOMETRY.notch_depth_px;
+    let center_y_px = header_rect.min.y + notch_px + (header_rect.height() - notch_px) * 0.5;
+    let badge_rect = Rect::from_center_size(
+        pos2(header_rect.max.x - 16.0, center_y_px),
+        vec2(18.0, 18.0),
+    );
+    let response = ui.interact(badge_rect, ui.next_auto_id(), Sense::hover());
+    ui.painter()
+        .circle_filled(badge_rect.center(), 8.0, STATUS_DANGER_SOLID);
+    ui.painter().text(
+        badge_rect.center(),
+        Align2::CENTER_CENTER,
+        "!",
+        FontId::new(11.5, font_family_semibold()),
+        TEXT_PRIMARY,
+    );
+    response.on_hover_text(error_text);
+}
+
+fn resolve_block_surface_colors(
+    visual_colors: BlockVisualColors,
     is_active: bool,
     has_validation_error: bool,
-    is_dragged_source: bool,
-) -> Color32 {
+    is_hovered: bool,
+) -> (Color32, Color32, f32) {
     if is_active {
-        return STATUS_RUNNING_TINT;
+        return (STATUS_RUNNING_TINT, STATUS_RUNNING, 2.0);
     }
     if has_validation_error {
-        return STATUS_DANGER_TINT;
+        return (STATUS_DANGER_TINT, STATUS_DANGER, 1.75);
     }
-    if is_dragged_source {
-        return SURFACE_HOVER;
-    }
-    SURFACE_ELEVATED
-}
-
-fn resolve_block_stroke(is_active: bool, has_validation_error: bool) -> Stroke {
-    if is_active {
-        return Stroke::new(2.0, STATUS_RUNNING);
-    }
-    if has_validation_error {
-        return Stroke::new(1.5, STATUS_DANGER);
-    }
-    Stroke::new(1.0, BORDER_STRONG)
+    let fill = if is_hovered {
+        visual_colors.fill_hover
+    } else {
+        visual_colors.fill
+    };
+    (
+        fill,
+        visual_colors.border,
+        FULL_BLOCK_GEOMETRY.stroke_width_px,
+    )
 }
 
 fn find_block_validation_message(
@@ -648,58 +714,53 @@ fn find_block_validation_message(
         .map(|issue| issue.message.as_str())
 }
 
-fn paint_notched_puzzle_chrome(
-    painter: &Painter,
-    block_rect: Rect,
-    accent_color: Color32,
-    draw_top_notch: bool,
-    draw_bottom_tab: bool,
-) {
-    let stripe_rect = Rect::from_min_max(
-        block_rect.min,
-        pos2(block_rect.min.x + BLOCK_STRIPE_WIDTH_PX, block_rect.max.y),
-    );
-    painter.rect_filled(
-        stripe_rect,
-        CornerRadius {
-            nw: CORNER_RADIUS_SM_PX,
-            sw: CORNER_RADIUS_SM_PX,
-            ne: 0,
-            se: 0,
-        },
-        accent_color,
-    );
-
-    if draw_top_notch {
-        let notch_rect = Rect::from_min_max(
-            pos2(
-                block_rect.min.x + PUZZLE_NOTCH_OFFSET_X_PX,
-                block_rect.min.y,
-            ),
-            pos2(
-                block_rect.min.x + PUZZLE_NOTCH_OFFSET_X_PX + PUZZLE_NOTCH_WIDTH_PX,
-                block_rect.min.y + PUZZLE_NOTCH_DEPTH_PX,
-            ),
-        );
-        painter.rect_filled(notch_rect, 1.0, BG_CANVAS);
+/// Formats a concise one-line parameter summary for floating drag ghost cards.
+fn summarize_statement_for_ghost(statement_kind: &StatementKind) -> String {
+    match statement_kind {
+        StatementKind::IfThen { condition, .. }
+        | StatementKind::IfThenElse { condition, .. }
+        | StatementKind::WhileCondition { condition, .. } => condition.display_label(),
+        StatementKind::RepeatCount { repeat_count, .. } => format!("{repeat_count} times"),
+        StatementKind::BreakLoop => "Exit current loop".to_string(),
+        StatementKind::StopScript => "End script pass".to_string(),
+        StatementKind::MouseClick {
+            mouse_button,
+            hold_duration_ms,
+        } => format!("{} · {hold_duration_ms} ms", mouse_button.short_label()),
+        StatementKind::MouseDown { mouse_button } | StatementKind::MouseUp { mouse_button } => {
+            mouse_button.display_label().to_string()
+        }
+        StatementKind::MouseMoveRelative {
+            delta_x_px,
+            delta_y_px,
+        } => format!("X {delta_x_px}, Y {delta_y_px} px"),
+        StatementKind::MouseScroll { vertical_steps } => format!("{vertical_steps} steps"),
+        StatementKind::KeyTap {
+            key_code,
+            hold_duration_ms,
+        } => format!("{} · {hold_duration_ms} ms", key_code.display_label()),
+        StatementKind::KeyDown { key_code } | StatementKind::KeyUp { key_code } => {
+            key_code.display_label().to_string()
+        }
+        StatementKind::TypeText { text, .. } => format!("\"{text}\""),
+        StatementKind::WaitFixed { delay_ms } => format!("{delay_ms} ms"),
+        StatementKind::WaitRandomUniform {
+            min_delay_ms,
+            max_delay_ms,
+        } => format!("{min_delay_ms}..{max_delay_ms} ms"),
+        StatementKind::WaitRandomGaussian {
+            base_delay_ms,
+            min_offset_ms,
+            max_offset_ms,
+            ..
+        } => format!("{base_delay_ms} + G[{min_offset_ms:.0}..{max_offset_ms:.0}] ms"),
+        StatementKind::SetVariable {
+            variable_name,
+            value,
+        } => format!("{variable_name} = {value}"),
+        StatementKind::ChangeVariable {
+            variable_name,
+            delta_value,
+        } => format!("{variable_name} += {delta_value}"),
     }
-
-    if draw_bottom_tab {
-        paint_bottom_puzzle_tab(painter, block_rect, accent_color);
-    }
-}
-
-/// Paints the protruding bottom connector tab shared by trigger hats, leaf blocks, and C-footers.
-pub(crate) fn paint_bottom_puzzle_tab(painter: &Painter, block_rect: Rect, accent_color: Color32) {
-    let tab_rect = Rect::from_min_max(
-        pos2(
-            block_rect.min.x + PUZZLE_NOTCH_OFFSET_X_PX,
-            block_rect.max.y - 1.0,
-        ),
-        pos2(
-            block_rect.min.x + PUZZLE_NOTCH_OFFSET_X_PX + PUZZLE_NOTCH_WIDTH_PX,
-            block_rect.max.y + PUZZLE_NOTCH_DEPTH_PX,
-        ),
-    );
-    painter.rect_filled(tab_rect, 1.5, accent_color);
 }

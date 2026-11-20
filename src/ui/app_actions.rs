@@ -1,17 +1,156 @@
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use clickforge_sdk::KeyCode;
+use egui::{Key, Modifiers};
+
 use crate::engine::generate_rust_source_from_script;
 use crate::models::{
-    CoordinatorCommand, GameTargetRule, ScriptDocument, ScriptMode, TargetScope,
+    CoordinatorCommand, GameTargetRule, ScriptDocument, ScriptMode, TargetScope, VisualProgram,
     inspect_script_validation,
 };
-use crate::ui::app::ClickForgeWorkbenchApp;
+use crate::ui::app::{ClickForgeWorkbenchApp, DeletedScriptUndoEntry};
 use crate::ui::block_canvas::BlockCanvasAction;
 use crate::ui::block_palette::PaletteAction;
 use crate::ui::rust_editor_panel::RustEditorAction;
 use crate::ui::script_settings_bar::SettingsBarAction;
-use crate::ui::sidebar::SidebarAction;
+use crate::ui::sidebar::{NewScriptTemplateChoice, SidebarAction, script_mode_for_template};
 use crate::ui::target_picker_modal::TargetPickerAction;
 
+const DELETE_UNDO_TOAST_DURATION_MS: u64 = 5_000;
+const MAX_UNDO_SNAPSHOTS_PER_SCRIPT: usize = 40;
+const MAX_TRACKED_HISTORY_SCRIPTS: usize = 64;
+const UNDO_COALESCE_WINDOW_MS: u64 = 450;
+
+/// Bounded per-script undo/redo snapshot stack for Visual Block editing.
+#[derive(Debug, Default)]
+pub(crate) struct VisualProgramHistory {
+    undo_stack: VecDeque<VisualProgram>,
+    redo_stack: VecDeque<VisualProgram>,
+    last_push_at: Option<Instant>,
+    last_block_count: usize,
+}
+
+impl VisualProgramHistory {
+    pub(crate) fn record_snapshot(
+        &mut self,
+        previous_program: VisualProgram,
+        current_block_count: usize,
+        is_pointer_down: bool,
+    ) {
+        let should_coalesce_drag = is_pointer_down
+            && self.last_block_count == current_block_count
+            && self.last_push_at.is_some_and(|pushed_at| {
+                pushed_at.elapsed() < Duration::from_millis(UNDO_COALESCE_WINDOW_MS)
+            });
+        if should_coalesce_drag {
+            return;
+        }
+        if self
+            .undo_stack
+            .back()
+            .is_some_and(|latest| *latest == previous_program)
+        {
+            return;
+        }
+        while self.undo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
+            self.undo_stack.pop_front();
+        }
+        self.undo_stack.push_back(previous_program);
+        self.redo_stack.clear();
+        self.last_push_at = Some(Instant::now());
+        self.last_block_count = current_block_count;
+    }
+
+    pub(crate) fn undo(&mut self, current_program: VisualProgram) -> Option<VisualProgram> {
+        let previous_program = self.undo_stack.pop_back()?;
+        while self.redo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
+            self.redo_stack.pop_front();
+        }
+        self.redo_stack.push_back(current_program);
+        self.last_push_at = None;
+        Some(previous_program)
+    }
+
+    pub(crate) fn redo(&mut self, current_program: VisualProgram) -> Option<VisualProgram> {
+        let next_program = self.redo_stack.pop_back()?;
+        while self.undo_stack.len() >= MAX_UNDO_SNAPSHOTS_PER_SCRIPT {
+            self.undo_stack.pop_front();
+        }
+        self.undo_stack.push_back(current_program);
+        self.last_push_at = None;
+        Some(next_program)
+    }
+}
+
 impl ClickForgeWorkbenchApp {
+    pub(crate) fn process_keyboard_shortcuts(&mut self, egui_context: &egui::Context) {
+        if self.active_key_capture.is_some()
+            || self.target_picker_state.is_open
+            || self.new_script_modal_state.is_open
+        {
+            return;
+        }
+
+        let did_press_save =
+            egui_context.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::S));
+        if did_press_save {
+            self.save_active_script();
+            return;
+        }
+
+        if egui_context.egui_wants_keyboard_input() {
+            return;
+        }
+
+        let is_visual_mode = self
+            .active_script_index()
+            .is_some_and(|index| self.scripts[index].mode == ScriptMode::VisualBlocks);
+        if !is_visual_mode {
+            return;
+        }
+
+        let did_press_redo = egui_context.input_mut(|input| {
+            input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                || input.consume_key(Modifiers::COMMAND, Key::Y)
+        });
+        if did_press_redo {
+            self.redo_active_visual_edit();
+            return;
+        }
+
+        let did_press_undo =
+            egui_context.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Z));
+        if did_press_undo {
+            self.undo_active_visual_edit();
+        }
+    }
+
+    pub(crate) fn record_visual_program_undo_snapshot(
+        &mut self,
+        script_id: &str,
+        previous_program: VisualProgram,
+        current_block_count: usize,
+        is_pointer_down: bool,
+    ) {
+        if self.visual_history_by_script_id.len() >= MAX_TRACKED_HISTORY_SCRIPTS
+            && !self.visual_history_by_script_id.contains_key(script_id)
+        {
+            let active_ids: HashSet<&str> = self
+                .scripts
+                .iter()
+                .map(|script| script.id.as_str())
+                .collect();
+            self.visual_history_by_script_id
+                .retain(|tracked_id, _| active_ids.contains(tracked_id.as_str()));
+        }
+
+        self.visual_history_by_script_id
+            .entry(script_id.to_string())
+            .or_default()
+            .record_snapshot(previous_program, current_block_count, is_pointer_down);
+    }
+
     pub(crate) fn apply_sidebar_actions(&mut self, actions: Vec<SidebarAction>) {
         for action in actions {
             match action {
@@ -37,22 +176,21 @@ impl ClickForgeWorkbenchApp {
                     self.new_script_modal_state
                         .open_with_defaults(self.scripts.len());
                 }
-                SidebarAction::CreateBlankScript {
+                SidebarAction::CreateScript {
                     name,
                     is_selected_game_scope,
-                    mode,
+                    template_choice,
+                    kill_switch_key,
                 } => {
-                    self.create_blank_script(name, is_selected_game_scope, mode);
-                }
-                SidebarAction::CreateFromBuildingUpgradeTemplate => {
-                    self.create_building_upgrade_template_copy();
+                    self.create_script_from_modal(
+                        name,
+                        is_selected_game_scope,
+                        template_choice,
+                        kill_switch_key,
+                    );
                 }
                 SidebarAction::SetMinimizeToTray(is_minimizing) => {
                     self.settings.minimize_to_tray_on_close = is_minimizing;
-                    self.persist_settings_quietly();
-                }
-                SidebarAction::ToggleTelemetryDrawer => {
-                    self.settings.show_telemetry_drawer = !self.settings.show_telemetry_drawer;
                     self.persist_settings_quietly();
                 }
             }
@@ -118,6 +256,9 @@ impl ClickForgeWorkbenchApp {
                         self.mark_script_dirty(&selected_id);
                     }
                 }
+                SettingsBarAction::ExportToRust => {
+                    self.export_active_script_to_rust();
+                }
             }
         }
     }
@@ -154,10 +295,16 @@ impl ClickForgeWorkbenchApp {
     }
 
     pub(crate) fn apply_palette_actions(&mut self, actions: Vec<PaletteAction>) {
+        if actions.is_empty() {
+            return;
+        }
         let Some(active_index) = self.active_script_index() else {
             return;
         };
+        let script_id = self.scripts[active_index].id.clone();
+        let before_program = self.scripts[active_index].visual_program.clone();
         let mut did_modify = false;
+
         for action in actions {
             match action {
                 PaletteAction::ApplyTrigger(new_trigger) => {
@@ -173,7 +320,15 @@ impl ClickForgeWorkbenchApp {
             }
         }
         if did_modify {
-            let script_id = self.scripts[active_index].id.clone();
+            let current_block_count = self.scripts[active_index]
+                .visual_program
+                .total_block_count();
+            self.record_visual_program_undo_snapshot(
+                &script_id,
+                before_program,
+                current_block_count,
+                false,
+            );
             self.mark_script_dirty(&script_id);
         }
     }
@@ -189,16 +344,7 @@ impl ClickForgeWorkbenchApp {
                     self.mark_script_dirty(&script_id);
                 }
                 BlockCanvasAction::ExportToRust => {
-                    let generated_rust =
-                        generate_rust_source_from_script(&self.scripts[active_index]);
-                    self.scripts[active_index].rust_source = generated_rust;
-                    self.scripts[active_index].mode = ScriptMode::AdvancedRust;
-                    let script_id = self.scripts[active_index].id.clone();
-                    self.mark_script_dirty(&script_id);
-                    self.show_toast(
-                        "Exported visual blocks to Rust and switched to Advanced Rust mode.",
-                        false,
-                    );
+                    self.export_active_script_to_rust();
                 }
             }
         }
@@ -236,7 +382,7 @@ impl ClickForgeWorkbenchApp {
         }
     }
 
-    fn save_active_script(&mut self) {
+    pub(crate) fn save_active_script(&mut self) {
         let Some(active_index) = self.active_script_index() else {
             return;
         };
@@ -255,6 +401,81 @@ impl ClickForgeWorkbenchApp {
                 self.show_toast(format!("Save blocked: {storage_error}"), true);
             }
         }
+    }
+
+    pub(crate) fn undo_active_visual_edit(&mut self) {
+        let Some(active_index) = self.active_script_index() else {
+            return;
+        };
+        let script_id = self.scripts[active_index].id.clone();
+        let current_program = self.scripts[active_index].visual_program.clone();
+        let Some(restored_program) = self
+            .visual_history_by_script_id
+            .get_mut(&script_id)
+            .and_then(|history| history.undo(current_program))
+        else {
+            return;
+        };
+        self.scripts[active_index].visual_program = restored_program;
+        self.mark_script_dirty(&script_id);
+        self.show_toast("Undid visual block edit.", false);
+    }
+
+    pub(crate) fn redo_active_visual_edit(&mut self) {
+        let Some(active_index) = self.active_script_index() else {
+            return;
+        };
+        let script_id = self.scripts[active_index].id.clone();
+        let current_program = self.scripts[active_index].visual_program.clone();
+        let Some(restored_program) = self
+            .visual_history_by_script_id
+            .get_mut(&script_id)
+            .and_then(|history| history.redo(current_program))
+        else {
+            return;
+        };
+        self.scripts[active_index].visual_program = restored_program;
+        self.mark_script_dirty(&script_id);
+        self.show_toast("Redid visual block edit.", false);
+    }
+
+    pub(crate) fn restore_last_deleted_script(&mut self) {
+        let Some(deleted_entry) = self.last_deleted_script.take() else {
+            return;
+        };
+        let restored_script = deleted_entry.script;
+        let restored_id = restored_script.id.clone();
+        let restored_name = restored_script.name.clone();
+        let insert_index = deleted_entry.original_index.min(self.scripts.len());
+
+        if self.repository.save_script(&restored_script).is_ok() {
+            let _ = self
+                .coordinator
+                .send_command(CoordinatorCommand::UpsertScript(restored_script.clone()));
+            self.dirty_script_ids.remove(&restored_id);
+        } else {
+            self.mark_script_dirty(&restored_id);
+        }
+
+        self.scripts.insert(insert_index, restored_script);
+        self.selected_script_id = Some(restored_id);
+        self.persist_settings_quietly();
+        self.show_toast(format!("Restored '{restored_name}'."), false);
+    }
+
+    fn export_active_script_to_rust(&mut self) {
+        let Some(active_index) = self.active_script_index() else {
+            return;
+        };
+        let generated_rust = generate_rust_source_from_script(&self.scripts[active_index]);
+        self.scripts[active_index].rust_source = generated_rust;
+        self.scripts[active_index].mode = ScriptMode::AdvancedRust;
+        let script_id = self.scripts[active_index].id.clone();
+        self.mark_script_dirty(&script_id);
+        self.show_toast(
+            "Exported visual blocks to Rust and switched to Advanced Rust mode.",
+            false,
+        );
     }
 
     fn set_script_enabled_by_id(&mut self, script_id: &str, is_enabled: bool) {
@@ -292,57 +513,58 @@ impl ClickForgeWorkbenchApp {
             });
     }
 
-    fn create_blank_script(
+    fn create_script_from_modal(
         &mut self,
         name: String,
         is_selected_game_scope: bool,
-        mode: ScriptMode,
+        template_choice: NewScriptTemplateChoice,
+        kill_switch_key: Option<KeyCode>,
     ) {
         let scope = if is_selected_game_scope {
             TargetScope::SelectedGame(GameTargetRule::default())
         } else {
             TargetScope::Global
         };
-        let new_script = ScriptDocument::new_blank(name, scope, mode);
-        let new_script_id = new_script.id.clone();
-        self.scripts.push(new_script);
-        self.selected_script_id = Some(new_script_id.clone());
-        self.mark_script_dirty(&new_script_id);
-        self.persist_settings_quietly();
 
-        if is_selected_game_scope {
-            self.window_watcher.refresh_now();
+        let mut new_script = match template_choice {
+            NewScriptTemplateChoice::BuildingUpgradeTemplate => {
+                let mut template_script = ScriptDocument::new_building_upgrade_template();
+                template_script.id = ScriptDocument::generate_unique_id();
+                template_script.name = name;
+                template_script.target_scope = scope;
+                template_script.kill_switch_key = kill_switch_key;
+                template_script.is_enabled = false;
+                template_script.touch_updated_timestamp();
+                template_script
+            }
+            NewScriptTemplateChoice::VisualBlocks | NewScriptTemplateChoice::AdvancedRust => {
+                let mut blank_script = ScriptDocument::new_blank(
+                    name,
+                    scope,
+                    script_mode_for_template(template_choice),
+                );
+                blank_script.kill_switch_key = kill_switch_key;
+                blank_script
+            }
+        };
+
+        let new_script_id = new_script.id.clone();
+        let new_script_name = new_script.name.clone();
+        let can_persist_now = inspect_script_validation(&new_script).is_valid();
+
+        if can_persist_now && self.repository.save_script(&new_script).is_ok() {
             let _ = self
                 .coordinator
-                .send_command(CoordinatorCommand::RefreshWindowsAndProcesses);
-            self.target_picker_state.open();
+                .send_command(CoordinatorCommand::UpsertScript(new_script.clone()));
+            self.show_toast(format!("Created '{new_script_name}'."), false);
+        } else {
+            new_script.is_enabled = false;
+            self.mark_script_dirty(&new_script_id);
         }
-    }
 
-    fn create_building_upgrade_template_copy(&mut self) {
-        let mut template_script = ScriptDocument::new_building_upgrade_template();
-        template_script.id = ScriptDocument::generate_unique_id();
-        let next_index = self.scripts.len().saturating_add(1);
-        if self
-            .scripts
-            .iter()
-            .any(|existing| existing.name == template_script.name)
-        {
-            template_script.name = format!("Building Upgrade Rapid Clicker ({next_index})");
-        }
-        let script_id = template_script.id.clone();
-
-        if let Err(save_error) = self.repository.save_script(&template_script) {
-            self.show_toast(format!("Failed to save template: {save_error}"), true);
-            return;
-        }
-        let _ = self
-            .coordinator
-            .send_command(CoordinatorCommand::UpsertScript(template_script.clone()));
-        self.scripts.push(template_script);
-        self.selected_script_id = Some(script_id);
+        self.scripts.push(new_script);
+        self.selected_script_id = Some(new_script_id);
         self.persist_settings_quietly();
-        self.show_toast("Created Building Upgrade Rapid Clicker script.", false);
     }
 
     fn duplicate_script_by_id(&mut self, script_id: &str) {
@@ -378,7 +600,8 @@ impl ClickForgeWorkbenchApp {
         let Some(position) = self.scripts.iter().position(|item| item.id == script_id) else {
             return;
         };
-        let removed_script = self.scripts.remove(position);
+        let mut removed_script = self.scripts.remove(position);
+        removed_script.is_enabled = false;
         self.dirty_script_ids.remove(script_id);
         let _ = self.repository.delete_script(script_id);
         let _ = self
@@ -391,6 +614,12 @@ impl ClickForgeWorkbenchApp {
             self.selected_script_id = self.scripts.first().map(|script| script.id.clone());
         }
         self.persist_settings_quietly();
-        self.show_toast(format!("Deleted '{}'.", removed_script.name), false);
+
+        self.status_toast = None;
+        self.last_deleted_script = Some(DeletedScriptUndoEntry {
+            script: removed_script,
+            original_index: position,
+            expires_at: Instant::now() + Duration::from_millis(DELETE_UNDO_TOAST_DURATION_MS),
+        });
     }
 }

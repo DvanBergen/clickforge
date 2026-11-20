@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use clickforge_sdk::KeyCode;
 use egui::{
-    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Sense,
-    Shadow, Stroke, Style, TextStyle, Visuals, vec2,
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, RichText,
+    Sense, Shadow, Stroke, Style, TextStyle, Visuals, vec2,
 };
 
 use crate::models::{BlockCategory, ScriptExecutionPhase};
@@ -14,28 +14,28 @@ use crate::models::{BlockCategory, ScriptExecutionPhase};
 pub const BG_CANVAS: Color32 = Color32::from_rgb(0x11, 0x13, 0x17);
 
 /// Primary panel surface for sidebar, palette, top settings bar, and telemetry drawer.
-pub const SURFACE_PANEL: Color32 = Color32::from_rgb(0x18, 0x1B, 0x21);
+pub const SURFACE_PANEL: Color32 = Color32::from_rgb(0x18, 0x1C, 0x23);
 
-/// Elevated surface for input controls, modal dialogs, and block bodies.
-pub const SURFACE_ELEVATED: Color32 = Color32::from_rgb(0x20, 0x24, 0x2D);
+/// Elevated surface for input controls, modal dialogs, and recessed cards.
+pub const SURFACE_ELEVATED: Color32 = Color32::from_rgb(0x21, 0x26, 0x31);
 
-/// Subtle hover surface for interactive buttons and selectable rows.
-pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x27, 0x2C, 0x37);
+/// Distinct hover and active selection surface above `SURFACE_ELEVATED`.
+pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x2C, 0x33, 0x42);
 
 /// Code editor surface recessed slightly darker than standard panels.
 pub const SURFACE_CODE: Color32 = Color32::from_rgb(0x14, 0x17, 0x1D);
 
 /// Crisp 1 px structural divider and container border.
-pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(0x2A, 0x30, 0x3C);
+pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(0x32, 0x3A, 0x4A);
 
 /// Emphasized border for focused widgets and modal outlines.
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x3D, 0x46, 0x57);
+pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x4A, 0x55, 0x6B);
 
 /// Primary high-contrast ink color on dark slate backgrounds.
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xEC, 0xEF, 0xF4);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xEE, 0xF1, 0xF6);
 
-/// Secondary metadata and helper ink color.
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x94, 0xA0, 0xB2);
+/// Secondary metadata and helper ink color passing WCAG AA on elevated surfaces.
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9A, 0xA7, 0xBA);
 
 /// Single primary interactive accent color (amber-copper).
 pub const ACCENT_PRIMARY: Color32 = Color32::from_rgb(0xE5, 0x9A, 0x38);
@@ -49,14 +49,26 @@ pub const INK_ON_ACCENT: Color32 = Color32::from_rgb(0x14, 0x12, 0x0E);
 /// Reserved status color for armed/running scripts and live active blocks.
 pub const STATUS_RUNNING: Color32 = Color32::from_rgb(0x2E, 0xA0, 0x43);
 
+/// High-contrast emerald ink passing WCAG AA on `STATUS_RUNNING_TINT`.
+pub const STATUS_RUNNING_INK: Color32 = Color32::from_rgb(0x44, 0xC4, 0x5E);
+
 /// Deep emerald fill for highlighting the currently executing block.
 pub const STATUS_RUNNING_TINT: Color32 = Color32::from_rgb(0x16, 0x2B, 0x1D);
 
-/// Reserved status color for Hard Kill-Switch, validation blockers, and emergency stop.
+/// Reserved status color for Hard Kill-Switch accents and borders.
 pub const STATUS_DANGER: Color32 = Color32::from_rgb(0xE0, 0x4F, 0x5F);
+
+/// Deep crimson fill for solid white-text danger buttons (`STOP ALL`).
+pub const STATUS_DANGER_SOLID: Color32 = Color32::from_rgb(0xC9, 0x3B, 0x4B);
+
+/// High-contrast coral-crimson ink passing WCAG AA on `STATUS_DANGER_TINT`.
+pub const STATUS_DANGER_INK: Color32 = Color32::from_rgb(0xF2, 0x6D, 0x7A);
 
 /// Dark crimson fill used for validation banners and danger controls.
 pub const STATUS_DANGER_TINT: Color32 = Color32::from_rgb(0x36, 0x19, 0x1F);
+
+/// High-contrast informational sky ink passing WCAG AA on `SURFACE_ELEVATED`.
+pub const STATUS_INFO_INK: Color32 = Color32::from_rgb(0x6C, 0xAD, 0xF5);
 
 /// Block category accent for Trigger hat blocks.
 pub const CATEGORY_TRIGGER: Color32 = Color32::from_rgb(0xD9, 0x77, 0x24);
@@ -77,43 +89,63 @@ pub const CATEGORY_VARIABLE: Color32 = Color32::from_rgb(0x7A, 0x86, 0x99);
 pub const SYNTAX_KEYWORD: Color32 = Color32::from_rgb(0xE5, 0x9A, 0x38);
 
 /// Syntax color for SDK and standard Rust type identifiers.
-pub const SYNTAX_TYPE: Color32 = Color32::from_rgb(0x6C, 0xA6, 0xE8);
+pub const SYNTAX_TYPE: Color32 = Color32::from_rgb(0x6C, 0xAD, 0xF5);
 
 /// Syntax color for string literals.
 pub const SYNTAX_STRING: Color32 = Color32::from_rgb(0x5E, 0xC2, 0xA6);
 
 /// Syntax color for numeric literals.
-pub const SYNTAX_NUMBER: Color32 = Color32::from_rgb(0xD9, 0xB8, 0x6C);
+pub const SYNTAX_NUMBER: Color32 = Color32::from_rgb(0xDF, 0xBF, 0x72);
 
-/// Syntax color for single-line and block comments.
-pub const SYNTAX_COMMENT: Color32 = Color32::from_rgb(0x72, 0x7F, 0x93);
+/// Syntax color for single-line and block comments (WCAG AA >= 5.8:1 on `SURFACE_CODE`).
+pub const SYNTAX_COMMENT: Color32 = Color32::from_rgb(0x86, 0x94, 0xA8);
 
-/// Small UI corner radius in logical pixels.
+/// Inner UI control corner radius in logical pixels (concentric inside 8 px outer cards).
 pub const CORNER_RADIUS_SM_PX: u8 = 4;
 
-/// Standard panel and card corner radius in logical pixels.
-pub const CORNER_RADIUS_MD_PX: u8 = 6;
+/// Outer panel, card, popover, and modal corner radius in logical pixels.
+pub const CORNER_RADIUS_MD_PX: u8 = 8;
 
-/// Small caption font size in logical pixels.
-pub const FONT_SIZE_SMALL_PX: f32 = 11.0;
+/// Rounded pill corner radius for segmented tracks, chips, and inline block wells.
+pub const CORNER_RADIUS_PILL_PX: u8 = 10;
+
+/// Small caption and metadata font size in logical pixels.
+pub const FONT_SIZE_SMALL_PX: f32 = 12.0;
 
 /// Primary UI body font size in logical pixels.
-pub const FONT_SIZE_BODY_PX: f32 = 13.5;
+pub const FONT_SIZE_BODY_PX: f32 = 14.0;
 
 /// Tabular monospace font size for timings, PIDs, and Rust code in logical pixels.
 pub const FONT_SIZE_MONOSPACE_PX: f32 = 13.0;
 
+/// Code editor monospace font size in logical pixels.
+pub const FONT_SIZE_CODE_PX: f32 = 13.0;
+
 /// Interactive button label font size in logical pixels.
-pub const FONT_SIZE_BUTTON_PX: f32 = 13.0;
+pub const FONT_SIZE_BUTTON_PX: f32 = 13.5;
 
 /// Section heading font size in logical pixels.
-pub const FONT_SIZE_HEADING_PX: f32 = 16.5;
+pub const FONT_SIZE_HEADING_PX: f32 = 17.5;
 
 const MAX_FONT_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const SANS_FONT_KEY: &str = "clickforge_fira_sans";
-const MONO_FONT_KEY: &str = "clickforge_monospace";
+const SANS_REGULAR_FONT_KEY: &str = "clickforge_fira_sans_regular";
+const SANS_SEMIBOLD_FONT_KEY: &str = "clickforge_fira_sans_semibold";
+const SANS_BOLD_FONT_KEY: &str = "clickforge_fira_sans_bold";
+const MONO_REGULAR_FONT_KEY: &str = "clickforge_mono_regular";
+const MONO_BOLD_FONT_KEY: &str = "clickforge_mono_bold";
 
-const FIRA_SANS_CANDIDATE_PATHS: [&str; 6] = [
+const FONT_FAMILY_SEMIBOLD_NAME: &str = "clickforge_semibold";
+const FONT_FAMILY_BOLD_NAME: &str = "clickforge_bold";
+const FONT_FAMILY_MONO_BOLD_NAME: &str = "clickforge_mono_bold";
+
+const WINDOW_SHADOW_OFFSET_Y_PX: i8 = 8;
+const WINDOW_SHADOW_BLUR_PX: u8 = 24;
+const WINDOW_SHADOW_ALPHA: u8 = 128;
+const POPUP_SHADOW_OFFSET_Y_PX: i8 = 6;
+const POPUP_SHADOW_BLUR_PX: u8 = 16;
+const POPUP_SHADOW_ALPHA: u8 = 116;
+
+const FIRA_REGULAR_CANDIDATE_PATHS: [&str; 6] = [
     "/usr/share/fonts/TTF/FiraSans-Regular.ttf",
     "/usr/share/fonts/TTF/FiraSans-Book.ttf",
     "/usr/share/fonts/truetype/fira/FiraSans-Regular.ttf",
@@ -122,7 +154,23 @@ const FIRA_SANS_CANDIDATE_PATHS: [&str; 6] = [
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
 ];
 
-const MONOSPACE_CANDIDATE_PATHS: [&str; 6] = [
+const FIRA_SEMIBOLD_CANDIDATE_PATHS: [&str; 5] = [
+    "/usr/share/fonts/TTF/FiraSans-SemiBold.ttf",
+    "/usr/share/fonts/TTF/FiraSans-Medium.ttf",
+    "/usr/share/fonts/TTF/FiraSans-Regular.ttf",
+    "/usr/share/fonts/truetype/fira/FiraSans-SemiBold.ttf",
+    "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+];
+
+const FIRA_BOLD_CANDIDATE_PATHS: [&str; 5] = [
+    "/usr/share/fonts/TTF/FiraSans-Bold.ttf",
+    "/usr/share/fonts/TTF/FiraSans-SemiBold.ttf",
+    "/usr/share/fonts/TTF/FiraSans-Regular.ttf",
+    "/usr/share/fonts/truetype/fira/FiraSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+];
+
+const MONO_REGULAR_CANDIDATE_PATHS: [&str; 6] = [
     "/usr/share/fonts/TTF/Hack-Regular.ttf",
     "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -130,6 +178,144 @@ const MONOSPACE_CANDIDATE_PATHS: [&str; 6] = [
     "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
 ];
+
+const MONO_BOLD_CANDIDATE_PATHS: [&str; 5] = [
+    "/usr/share/fonts/TTF/Hack-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/TTF/Hack-Regular.ttf",
+    "/usr/share/fonts/truetype/hack/Hack-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+];
+
+/// Complete dark-mode color palette for rendering a visual block category with high contrast.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockVisualColors {
+    pub fill: Color32,
+    pub fill_hover: Color32,
+    pub border: Color32,
+    pub top_highlight: Color32,
+    pub spine_fill: Color32,
+    pub pill_well_bg: Color32,
+    pub pill_well_border: Color32,
+    pub badge_bg: Color32,
+    pub text_primary: Color32,
+    pub text_muted: Color32,
+}
+
+/// Returns the SemiBold proportional font family backed by `FiraSans-SemiBold`.
+pub fn font_family_semibold() -> FontFamily {
+    static FAMILY_NAME: OnceLock<Arc<str>> = OnceLock::new();
+    let name_arc = FAMILY_NAME.get_or_init(|| Arc::from(FONT_FAMILY_SEMIBOLD_NAME));
+    FontFamily::Name(Arc::clone(name_arc))
+}
+
+/// Returns the Bold proportional font family backed by `FiraSans-Bold`.
+pub fn font_family_bold() -> FontFamily {
+    static FAMILY_NAME: OnceLock<Arc<str>> = OnceLock::new();
+    let name_arc = FAMILY_NAME.get_or_init(|| Arc::from(FONT_FAMILY_BOLD_NAME));
+    FontFamily::Name(Arc::clone(name_arc))
+}
+
+/// Returns the Bold monospace font family backed by `Hack-Bold`.
+pub fn font_family_mono_bold() -> FontFamily {
+    static FAMILY_NAME: OnceLock<Arc<str>> = OnceLock::new();
+    let name_arc = FAMILY_NAME.get_or_init(|| Arc::from(FONT_FAMILY_MONO_BOLD_NAME));
+    FontFamily::Name(Arc::clone(name_arc))
+}
+
+/// Builds a `RichText` span rendered in the SemiBold proportional family.
+pub fn rich_semibold(text: impl Into<String>, size_px: f32, color: Color32) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(size_px, font_family_semibold()))
+        .color(color)
+}
+
+/// Builds a `RichText` span rendered in the Bold proportional family.
+pub fn rich_bold(text: impl Into<String>, size_px: f32, color: Color32) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(size_px, font_family_bold()))
+        .color(color)
+}
+
+/// Builds a `RichText` span rendered in the Regular tabular monospace family.
+pub fn rich_mono(text: impl Into<String>, size_px: f32, color: Color32) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(size_px, FontFamily::Monospace))
+        .color(color)
+}
+
+/// Builds a `RichText` span rendered in the Bold tabular monospace family.
+pub fn rich_mono_bold(text: impl Into<String>, size_px: f32, color: Color32) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(size_px, font_family_mono_bold()))
+        .color(color)
+}
+
+/// Returns the cohesive dark-mode surface, border, and high-contrast ink tokens for a block category.
+pub fn block_visual_colors(category: BlockCategory) -> BlockVisualColors {
+    match category {
+        BlockCategory::Trigger => BlockVisualColors {
+            fill: Color32::from_rgb(0x4D, 0x2A, 0x10),
+            fill_hover: Color32::from_rgb(0x5E, 0x35, 0x15),
+            border: CATEGORY_TRIGGER,
+            top_highlight: Color32::from_rgb(0xE8, 0x98, 0x4E),
+            spine_fill: Color32::from_rgb(0x3F, 0x22, 0x0C),
+            pill_well_bg: Color32::from_rgb(0x26, 0x14, 0x07),
+            pill_well_border: Color32::from_rgb(0x8C, 0x4E, 0x1B),
+            badge_bg: Color32::from_rgb(0x69, 0x3A, 0x14),
+            text_primary: Color32::from_rgb(0xFF, 0xF4, 0xE6),
+            text_muted: Color32::from_rgb(0xE8, 0xC4, 0x9E),
+        },
+        BlockCategory::Control => BlockVisualColors {
+            fill: Color32::from_rgb(0x45, 0x35, 0x11),
+            fill_hover: Color32::from_rgb(0x55, 0x42, 0x17),
+            border: CATEGORY_CONTROL,
+            top_highlight: Color32::from_rgb(0xDF, 0xB8, 0x56),
+            spine_fill: Color32::from_rgb(0x39, 0x2B, 0x0D),
+            pill_well_bg: Color32::from_rgb(0x24, 0x1B, 0x08),
+            pill_well_border: Color32::from_rgb(0x8A, 0x6A, 0x1F),
+            badge_bg: Color32::from_rgb(0x5E, 0x49, 0x18),
+            text_primary: Color32::from_rgb(0xFF, 0xF8, 0xE3),
+            text_muted: Color32::from_rgb(0xE3, 0xCF, 0xA0),
+        },
+        BlockCategory::Action => BlockVisualColors {
+            fill: Color32::from_rgb(0x17, 0x32, 0x4D),
+            fill_hover: Color32::from_rgb(0x1E, 0x40, 0x63),
+            border: Color32::from_rgb(0x4A, 0x90, 0xD9),
+            top_highlight: Color32::from_rgb(0x73, 0xB0, 0xED),
+            spine_fill: Color32::from_rgb(0x12, 0x28, 0x3E),
+            pill_well_bg: Color32::from_rgb(0x0D, 0x1D, 0x2E),
+            pill_well_border: Color32::from_rgb(0x31, 0x62, 0x96),
+            badge_bg: Color32::from_rgb(0x21, 0x47, 0x6E),
+            text_primary: Color32::from_rgb(0xED, 0xF5, 0xFF),
+            text_muted: Color32::from_rgb(0xB0, 0xCC, 0xE8),
+        },
+        BlockCategory::Timing => BlockVisualColors {
+            fill: Color32::from_rgb(0x13, 0x3B, 0x36),
+            fill_hover: Color32::from_rgb(0x19, 0x4C, 0x46),
+            border: Color32::from_rgb(0x2F, 0xA8, 0x99),
+            top_highlight: Color32::from_rgb(0x56, 0xC7, 0xB8),
+            spine_fill: Color32::from_rgb(0x0E, 0x2F, 0x2B),
+            pill_well_bg: Color32::from_rgb(0x0A, 0x21, 0x1E),
+            pill_well_border: Color32::from_rgb(0x21, 0x73, 0x68),
+            badge_bg: Color32::from_rgb(0x1B, 0x52, 0x4B),
+            text_primary: Color32::from_rgb(0xE8, 0xFA, 0xF7),
+            text_muted: Color32::from_rgb(0xA5, 0xD6, 0xCF),
+        },
+        BlockCategory::Variable => BlockVisualColors {
+            fill: Color32::from_rgb(0x27, 0x2E, 0x3B),
+            fill_hover: Color32::from_rgb(0x31, 0x3A, 0x4A),
+            border: Color32::from_rgb(0x7A, 0x89, 0xA1),
+            top_highlight: Color32::from_rgb(0x9D, 0xAC, 0xC4),
+            spine_fill: Color32::from_rgb(0x1F, 0x25, 0x30),
+            pill_well_bg: Color32::from_rgb(0x15, 0x19, 0x21),
+            pill_well_border: Color32::from_rgb(0x51, 0x5C, 0x6E),
+            badge_bg: Color32::from_rgb(0x36, 0x40, 0x52),
+            text_primary: Color32::from_rgb(0xEF, 0xF3, 0xF8),
+            text_muted: Color32::from_rgb(0xB8, 0xC4, 0xD6),
+        },
+    }
+}
 
 /// Applies the Forge Slate visual theme, spacing tokens, and system fonts once at startup.
 pub fn apply_forge_slate_theme(egui_context: &egui::Context) {
@@ -150,7 +336,7 @@ pub fn apply_forge_slate_theme(egui_context: &egui::Context) {
     );
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(FONT_SIZE_HEADING_PX, FontFamily::Proportional),
+        FontId::new(FONT_SIZE_HEADING_PX, font_family_bold()),
     );
     style.text_styles.insert(
         TextStyle::Monospace,
@@ -158,12 +344,12 @@ pub fn apply_forge_slate_theme(egui_context: &egui::Context) {
     );
 
     style.spacing.item_spacing = vec2(8.0, 6.0);
-    style.spacing.button_padding = vec2(9.0, 4.0);
-    style.spacing.window_margin = Margin::same(10);
-    style.spacing.menu_margin = Margin::same(6);
+    style.spacing.button_padding = vec2(10.0, 5.0);
+    style.spacing.window_margin = Margin::same(12);
+    style.spacing.menu_margin = Margin::same(8);
     style.spacing.indent = 16.0;
-    style.spacing.combo_width = 140.0;
-    style.spacing.interact_size = vec2(32.0, 24.0);
+    style.spacing.combo_width = 148.0;
+    style.spacing.interact_size = vec2(36.0, 28.0);
 
     style.visuals = build_forge_slate_visuals();
     egui_context.set_theme(egui::ThemePreference::Dark);
@@ -177,9 +363,19 @@ fn build_forge_slate_visuals() -> Visuals {
     visuals.window_fill = SURFACE_PANEL;
     visuals.window_stroke = Stroke::new(1.0, BORDER_STRONG);
     visuals.window_corner_radius = CornerRadius::same(CORNER_RADIUS_MD_PX);
-    visuals.menu_corner_radius = CornerRadius::same(CORNER_RADIUS_SM_PX);
-    visuals.window_shadow = Shadow::NONE;
-    visuals.popup_shadow = Shadow::NONE;
+    visuals.menu_corner_radius = CornerRadius::same(CORNER_RADIUS_MD_PX);
+    visuals.window_shadow = Shadow {
+        offset: [0, WINDOW_SHADOW_OFFSET_Y_PX],
+        blur: WINDOW_SHADOW_BLUR_PX,
+        spread: 0,
+        color: Color32::from_black_alpha(WINDOW_SHADOW_ALPHA),
+    };
+    visuals.popup_shadow = Shadow {
+        offset: [0, POPUP_SHADOW_OFFSET_Y_PX],
+        blur: POPUP_SHADOW_BLUR_PX,
+        spread: 0,
+        color: Color32::from_black_alpha(POPUP_SHADOW_ALPHA),
+    };
     visuals.extreme_bg_color = BG_CANVAS;
     visuals.text_edit_bg_color = Some(SURFACE_CODE);
     visuals.faint_bg_color = SURFACE_ELEVATED;
@@ -188,7 +384,7 @@ fn build_forge_slate_visuals() -> Visuals {
     visuals.weak_text_color = Some(TEXT_MUTED);
     visuals.hyperlink_color = ACCENT_PRIMARY;
     visuals.warn_fg_color = ACCENT_PRIMARY;
-    visuals.error_fg_color = STATUS_DANGER;
+    visuals.error_fg_color = STATUS_DANGER_INK;
     visuals.selection.bg_fill = ACCENT_PRIMARY_TINT;
     visuals.selection.stroke = Stroke::new(1.0, ACCENT_PRIMARY);
 
@@ -231,35 +427,100 @@ fn build_forge_slate_visuals() -> Visuals {
 
 fn load_system_fonts(egui_context: &egui::Context) {
     let mut font_definitions = FontDefinitions::default();
-    let mut did_install_any = false;
 
-    if let Some(sans_bytes) = read_first_available_font(&FIRA_SANS_CANDIDATE_PATHS) {
-        font_definitions.font_data.insert(
-            SANS_FONT_KEY.to_string(),
-            Arc::new(FontData::from_owned(sans_bytes)),
-        );
-        if let Some(proportional_list) =
+    let has_sans_regular = register_font_face(
+        &mut font_definitions,
+        SANS_REGULAR_FONT_KEY,
+        &FIRA_REGULAR_CANDIDATE_PATHS,
+    );
+    let has_sans_semibold = register_font_face(
+        &mut font_definitions,
+        SANS_SEMIBOLD_FONT_KEY,
+        &FIRA_SEMIBOLD_CANDIDATE_PATHS,
+    );
+    let has_sans_bold = register_font_face(
+        &mut font_definitions,
+        SANS_BOLD_FONT_KEY,
+        &FIRA_BOLD_CANDIDATE_PATHS,
+    );
+    let has_mono_regular = register_font_face(
+        &mut font_definitions,
+        MONO_REGULAR_FONT_KEY,
+        &MONO_REGULAR_CANDIDATE_PATHS,
+    );
+    let has_mono_bold = register_font_face(
+        &mut font_definitions,
+        MONO_BOLD_FONT_KEY,
+        &MONO_BOLD_CANDIDATE_PATHS,
+    );
+
+    if has_sans_regular
+        && let Some(proportional_chain) =
             font_definitions.families.get_mut(&FontFamily::Proportional)
-        {
-            proportional_list.insert(0, SANS_FONT_KEY.to_string());
-        }
-        did_install_any = true;
+    {
+        proportional_chain.insert(0, SANS_REGULAR_FONT_KEY.to_string());
     }
 
-    if let Some(mono_bytes) = read_first_available_font(&MONOSPACE_CANDIDATE_PATHS) {
-        font_definitions.font_data.insert(
-            MONO_FONT_KEY.to_string(),
-            Arc::new(FontData::from_owned(mono_bytes)),
-        );
-        if let Some(monospace_list) = font_definitions.families.get_mut(&FontFamily::Monospace) {
-            monospace_list.insert(0, MONO_FONT_KEY.to_string());
-        }
-        did_install_any = true;
+    if has_mono_regular
+        && let Some(monospace_chain) = font_definitions.families.get_mut(&FontFamily::Monospace)
+    {
+        monospace_chain.insert(0, MONO_REGULAR_FONT_KEY.to_string());
     }
 
-    if did_install_any {
-        egui_context.set_fonts(font_definitions);
+    let proportional_fallbacks = font_definitions
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let monospace_fallbacks = font_definitions
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut semibold_chain = proportional_fallbacks.clone();
+    if has_sans_semibold {
+        semibold_chain.insert(0, SANS_SEMIBOLD_FONT_KEY.to_string());
     }
+    font_definitions
+        .families
+        .insert(font_family_semibold(), semibold_chain);
+
+    let mut bold_chain = proportional_fallbacks;
+    if has_sans_semibold {
+        bold_chain.insert(0, SANS_SEMIBOLD_FONT_KEY.to_string());
+    }
+    if has_sans_bold {
+        bold_chain.insert(0, SANS_BOLD_FONT_KEY.to_string());
+    }
+    font_definitions
+        .families
+        .insert(font_family_bold(), bold_chain);
+
+    let mut mono_bold_chain = monospace_fallbacks;
+    if has_mono_bold {
+        mono_bold_chain.insert(0, MONO_BOLD_FONT_KEY.to_string());
+    }
+    font_definitions
+        .families
+        .insert(font_family_mono_bold(), mono_bold_chain);
+
+    egui_context.set_fonts(font_definitions);
+}
+
+fn register_font_face(
+    font_definitions: &mut FontDefinitions,
+    font_key: &str,
+    candidate_paths: &[&str],
+) -> bool {
+    let Some(font_bytes) = read_first_available_font(candidate_paths) else {
+        return false;
+    };
+    font_definitions.font_data.insert(
+        font_key.to_string(),
+        Arc::new(FontData::from_owned(font_bytes)),
+    );
+    true
 }
 
 fn read_first_available_font(candidate_paths: &[&str]) -> Option<Vec<u8>> {
@@ -302,9 +563,11 @@ pub fn phase_status_color(phase: ScriptExecutionPhase) -> Color32 {
         ScriptExecutionPhase::Disabled => TEXT_MUTED,
         ScriptExecutionPhase::WaitingForFocus => CATEGORY_VARIABLE,
         ScriptExecutionPhase::Armed => ACCENT_PRIMARY,
-        ScriptExecutionPhase::Running => STATUS_RUNNING,
-        ScriptExecutionPhase::Compiling => CATEGORY_ACTION,
-        ScriptExecutionPhase::StoppedByKillSwitch | ScriptExecutionPhase::Error => STATUS_DANGER,
+        ScriptExecutionPhase::Running => STATUS_RUNNING_INK,
+        ScriptExecutionPhase::Compiling => STATUS_INFO_INK,
+        ScriptExecutionPhase::StoppedByKillSwitch | ScriptExecutionPhase::Error => {
+            STATUS_DANGER_INK
+        }
     }
 }
 
@@ -332,12 +595,28 @@ pub fn render_badge_pill(
         .corner_radius(CornerRadius::same(CORNER_RADIUS_SM_PX))
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label_text)
-                    .size(FONT_SIZE_SMALL_PX)
-                    .color(text_color),
-            );
+            ui.label(rich_semibold(label_text, FONT_SIZE_SMALL_PX, text_color));
         });
+}
+
+/// Builds a bordered or borderless `egui::Button` with explicit Forge Slate styling.
+pub(crate) fn build_styled_button(
+    label: RichText,
+    fill_color: Color32,
+    border_color: Color32,
+    corner_radius_px: u8,
+    min_size_px: egui::Vec2,
+) -> egui::Button<'static> {
+    let stroke = if border_color == Color32::TRANSPARENT {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, border_color)
+    };
+    egui::Button::new(label)
+        .fill(fill_color)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(corner_radius_px))
+        .min_size(min_size_px)
 }
 
 /// Truncates display text safely on Unicode character boundaries with an ellipsis.

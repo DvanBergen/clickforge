@@ -47,7 +47,7 @@ impl Default for AppSettings {
         Self {
             minimize_to_tray_on_close: true,
             start_minimized_to_tray: false,
-            show_telemetry_drawer: true,
+            show_telemetry_drawer: false,
             telemetry_drawer_height_px: DEFAULT_TELEMETRY_DRAWER_HEIGHT_PX,
             window_width_px: DEFAULT_WINDOW_WIDTH_PX,
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
