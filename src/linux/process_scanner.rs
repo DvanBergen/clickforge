@@ -414,7 +414,7 @@ mod tests {
             Some("GameClient.exe")
         );
 
-        let environ_bytes = b"HOME=/home/danny\0SteamAppId=2560650\0DISPLAY=:0\0";
+        let environ_bytes = b"HOME=/tmp/clickforge-test-home\0SteamAppId=2560650\0DISPLAY=:0\0";
         assert_eq!(
             extract_steam_app_id_from_environ(environ_bytes).as_deref(),
             Some("2560650")
